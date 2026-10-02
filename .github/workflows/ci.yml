@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'refactor/**']
+  pull_request:
+
+jobs:
+  unit:
+    name: unit tests (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # import purity is proven in-process by tests/import-purity.test.mjs
+      # (part of npm test) and structurally by the boundary suite
+      - run: npm test
+
+  build:
+    name: build + package checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: boundary gate (structure)
+        run: node tests/harness-boundary.test.cjs
+      - name: pack + content check
+        run: |
+          npm pack
+          CONTENT=$(tar -tzf locus-harness-*.tgz)
+          echo "$CONTENT"
+          echo "$CONTENT" | grep -q 'package/src/index.js'
+          echo "$CONTENT" | grep -q 'package/LICENSE'
+          # nothing outside src/ + LICENSE + README + package.json
+          if echo "$CONTENT" | grep -qv -E '^package/(src/|LICENSE|README\.md|package\.json)'; then
+            echo 'unexpected file in the package'; exit 1
+          fi
+
+  browser:
+    name: harness host browser gate (headless Chrome)
+    runs-on: ubuntu-latest
+    needs: [unit, build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: |
+          CHROME=$(which google-chrome || which chromium || true)
+          export CHROME
+          npm run test:e2e
+
+  consumer:
+    name: out-of-checkout tarball consumer (headless Chrome)
+    runs-on: ubuntu-latest
+    needs: [unit, build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm pack
+      # ISOLATION: the consumer is assembled and run in a directory under
+      # RUNNER_TEMP, never inside the checkout — it cannot fall back to the
+      # checkout's node_modules or src. Only test infrastructure is copied:
+      # the consumer page, its manifest, the gate driver and the tarball.
+      # No harness implementation file is a consumer dependency.
+      - name: assemble the consumer OUTSIDE the checkout (RUNNER_TEMP)
+        run: |
+          CONSUMER_DIR="${{ runner.temp }}/locus-harness-consumer-e2e"
+          mkdir -p "$CONSUMER_DIR"
+          cp locus-harness-*.tgz "$CONSUMER_DIR/locus-harness.tgz"
+          cp tools/consumer-e2e/package.json "$CONSUMER_DIR/"
+          cp tools/consumer-e2e/index.html "$CONSUMER_DIR/"
+          cp tools/consumer-e2e/vite.config.js "$CONSUMER_DIR/"
+          cp tools/consumer-e2e/consumer-main.js "$CONSUMER_DIR/consumer-main.js"
+          mkdir -p "$CONSUMER_DIR/tests"
+          cp tools/consumer-e2e/e2e-consumer.cjs "$CONSUMER_DIR/tests/e2e-consumer.cjs"
+          cp tests/helpers/chrome.cjs "$CONSUMER_DIR/tests/chrome-helper.cjs"
+          echo "CONSUMER_DIR=$CONSUMER_DIR" >> "$GITHUB_ENV"
+          echo "consumer assembled at: $CONSUMER_DIR"
+      - name: install (tarball + the consumer's own build tool only)
+        working-directory: ${{ env.CONSUMER_DIR }}
+        run: npm install
+      - name: the package resolves inside the CONSUMER's node_modules only
+        working-directory: ${{ env.CONSUMER_DIR }}
+        run: |
+          node -e "
+          const { createRequire } = require('module');
+          const req = createRequire(process.cwd() + '/index.js');
+          const entry = req.resolve('locus-harness');
+          console.log('resolved entry:', entry);
+          if (!entry.includes(process.cwd().replace(/\\\\/g, '/') + '/node_modules/locus-harness/')) {
+            console.error('package did not resolve inside the consumer node_modules'); process.exit(1);
+          }
+          "
+      - name: build the consumer with its own tooling
+        working-directory: ${{ env.CONSUMER_DIR }}
+        run: npx vite build
+      - name: serve + run the consumer browser gate (gates A–J)
+        working-directory: ${{ env.CONSUMER_DIR }}
+        run: |
+          CHROME=$(which google-chrome || which chromium || true)
+          export CHROME
+          npx vite preview --host 127.0.0.1 --port 4931 --strictPort &
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null http://127.0.0.1:4931/; then break; fi
+            sleep 0.5
+          done
+          node tests/e2e-consumer.cjs

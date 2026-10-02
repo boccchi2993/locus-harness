@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>locus-harness tarball consumer</title>
+</head>
+<body>
+<!--
+  Out-of-checkout CONSUMER page (M3b acceptance gate). Built by the
+  consumer's own Vite from an import of the PUBLIC package entry only
+  ('locus-harness' — resolved from THIS project's node_modules at build
+  time; the build fails if the package entry cannot be resolved). It
+  never reads the locus-harness checkout: everything below drives the
+  packaged implementation through the same public surface an external
+  host would use.
+-->
+<script type="module" src="./consumer-main.js"></script>
+</body>
+</html>
