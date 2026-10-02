@@ -11,11 +11,22 @@ import {
   createCapabilityManager, SkillSourceStore, registerPluginRuntimeProvider,
   validatePluginPayload,
   pythonExtensionKeyOf, buildSystemPrompt,
+  // M3b review R1 (F1): the descriptor validators + the skill-instance
+  // contract data, NAMED imports from the public entry — a missing entry
+  // export fails this build (proven against the eb70f85 tarball).
+  validateCapabilityDescriptor, validatePluginDescriptor, validateSkillDescriptor,
+  validateMcpDescriptor, skillInstancePath, SKILL_INSTANCE_ROOT,
+  SKILL_INSTANCE_MARKER, SKILL_INSTANCE_MAX_BYTES, sha256Hex,
 } from 'locus-harness';
+import { runLifecycleScenario } from './lifecycle-scenario.js';
 
 const errors = [];
+let unhandledRejectionCount = 0;
 window.addEventListener('error', (e) => errors.push(String(e.message || e)));
-window.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + String((e.reason && e.reason.message) || e.reason)));
+window.addEventListener('unhandledrejection', (e) => {
+  errors.push('unhandledrejection: ' + String((e.reason && e.reason.message) || e.reason));
+  unhandledRejectionCount++;
+});
 
 const results = {};
 const evTypes = (events) => events.map((e) => e.type).join(',');
@@ -174,49 +185,26 @@ const CONFIG = { dialect: 'openai', apiBase: 'https://api.example.test/v1', mode
     };
   }
 
-  // ============ C. TaskRunner prepare/run/cancel + exactly-once termination ============
+  // ============ C. TaskRunner cancel boundary around a PARKED run ============
+  // (M3b review R1, F2) The OLD scenario waited a fixed setTimeout(20),
+  // released the park immediately after cancel and asserted the boundary
+  // only AFTER `ended` had settled — an injected wrapper that ended the
+  // task early and reopened admission passed every old check. THIS
+  // scenario uses the shared entered/release barriers and the SHARED
+  // verdict: pre-release it proves the caller-visible ended is unsettled,
+  // no task_end was published, a second submit is rejected by the real
+  // admission contract (submit() returns null) and the run is still
+  // parked; post-release it proves the cancelled outcome, exactly one
+  // task_start/task_end, a real run exit, reopened admission, a completed
+  // follow-up, no late duplicate terminations and no unhandled rejections.
   {
-    const events = [];
-    let runStarted = false;
-    let releaseRun;
-    const runParked = new Promise((resolve) => { releaseRun = resolve; });
-    let firstTask = true;
-    const runner = createTaskRunner({
-      emit: (e) => events.push(e),
-      sessionEpoch: () => 1,
-      prepare: async (handle) => {
-        if (!firstTask) return { status: 'silent' }; // the follow-up admission probe
-        firstTask = false;
-        return {
-          status: 'ready',
-          epoch: 1,
-          run: async (ctx) => {
-            runStarted = true;
-            ctx.emit({ type: 'task_start', input: 'x' });
-            await runParked; // parked until the test cancels
-            if (ctx.signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
-          },
-        };
-      },
-    });
-    const handle = runner.submit('task C');
-    const prepareDone = await (async () => { await new Promise((r) => setTimeout(r, 20)); return !!runStarted; })();
-    const endEventsBeforeCancel = events.filter((e) => e.type === 'task_end').length;
-    handle.cancel('test-cancel');
-    releaseRun();
-    const outcome = await handle.ended;
-    const endEvents = events.filter((e) => e.type === 'task_end');
-    // release BEFORE the outcome settles: assert the pre-release unsettled state
-    const handle2 = runner.submit('task C2'); // admission reopened only after the boundary
-    const outcome2 = handle2 ? await handle2.ended : null;
+    const scenario = await runLifecycleScenario({
+      createTaskRunner,
+      unhandledRejections: () => unhandledRejectionCount,
+    }, null);
     results.C = {
-      prepareStartedRun: prepareDone,
-      endsBeforeCancel: endEventsBeforeCancel,
-      outcomeReason: outcome.reason,
-      exactlyOneEnd: endEvents.length === 1 && endEvents[0].reason === 'cancelled',
-      admissionReopenedAfterBoundary: !!handle2,
-      outcome2Reason: outcome2 && outcome2.reason,
-      startEvents: events.filter((e) => e.type === 'task_start').length,
+      verdict: scenario.verdict,
+      observation: scenario.observation,
     };
   }
 
@@ -441,6 +429,79 @@ const CONFIG = { dialect: 'openai', apiBase: 'https://api.example.test/v1', mode
     try { validatePluginPayload({ id: 'bad' }, { files: { '../evil.py': 'x' }, imports: [] }); }
     catch (e) { rejectCode = e.code || e.name; }
     results.H2 = { rejectCode };
+  }
+
+  // ============ K. public descriptor validators + skill-instance contract ============
+  // (M3b review R1, F1) The validators and the contract data are NAMED
+  // imports at the top of this file — a missing entry export breaks this
+  // build. The call shapes and error semantics mirror the REAL product
+  // callers at 2aec76e: capability-package.js normalizeDescriptor (the four
+  // validators), its 256 KiB init read (SKILL_INSTANCE_MAX_BYTES via
+  // SkillSourceStore's own bound) and bundle hashing (sha256Hex);
+  // extensions.js instance identity (skillInstancePath / SKILL_INSTANCE_ROOT)
+  // and the Harness-owned install marker (SKILL_INSTANCE_MARKER). The
+  // contract is cross-checked against what a REAL CapabilityManager
+  // materializes — never against hand-copied numbers.
+  {
+    const capOk = validateCapabilityDescriptor({
+      id: 'k-cap', version: '1.0', displayName: 'K Capability', description: 'd',
+      skills: ['k-skill'],
+    });
+    const skillOk = validateSkillDescriptor({ id: 'k-skill', version: '1', description: 'guide' });
+    const mcpOk = validateMcpDescriptor({ id: 'k-mcp', displayName: 'K MCP' });
+    let badPlugin = null;
+    try { validatePluginDescriptor({ id: 'k-plugin', version: '1', runtime: 'python', authority: 'network' }); }
+    catch (e) { badPlugin = e; }
+    let badSkill = null;
+    try { validateSkillDescriptor({ id: 'k-skill', version: '1', description: 'g', body: 'smuggled' }); }
+    catch (e) { badSkill = e; }
+
+    const sources = new SkillSourceStore();
+    let tooBig = null;
+    try { sources.define('k-big', '1', 'x'.repeat(SKILL_INSTANCE_MAX_BYTES + 1)); }
+    catch (e) { tooBig = e; }
+    const text = '# k skill\n';
+    sources.define('k-skill', '1', text);
+
+    const files = new Map();
+    const nf = () => { const e = new Error('nf'); e.name = 'NotFoundError'; return e; };
+    const manager = createCapabilityManager({
+      catalogs: {
+        capabilities: [{
+          id: 'k-cap', version: '1.0', displayName: 'K Capability', description: 'd',
+          skills: ['k-skill'],
+        }],
+        skills: [{ id: 'k-skill', version: '1', description: 'guide' }],
+      },
+      sources,
+      instances: {
+        async readBytes(rel) { if (!files.has(rel)) throw nf(); return files.get(rel); },
+        async writeBytes(rel, bytes) { files.set(rel, new Uint8Array(bytes)); },
+        async removeDir(capId) { for (const k of [...files.keys()]) if (k.startsWith(capId + '/')) files.delete(k); },
+        async stat(rel) { if (!files.has(rel)) throw nf(); return { kind: 'file' }; },
+      },
+    });
+    const state = await manager.enable('k-cap');
+    const instanceAbs = skillInstancePath('k-cap', 'k-skill');
+    const instanceRel = instanceAbs.slice(SKILL_INSTANCE_ROOT.length + 1);
+    let marker = null;
+    try { marker = JSON.parse(new TextDecoder().decode(files.get('k-cap/' + SKILL_INSTANCE_MARKER))); }
+    catch (e) { marker = null; }
+    results.K = {
+      capNormalized: capOk.kind === 'capability' && capOk.skills.join() === 'k-skill',
+      skillNormalized: skillOk.kind === 'skill' && skillOk.id === 'k-skill',
+      mcpNormalized: mcpOk.kind === 'mcp' && mcpOk.id === 'k-mcp',
+      badPluginCode: badPlugin ? badPlugin.code : null,
+      badSkillCode: badSkill ? badSkill.code : null,
+      tooBigCode: tooBig ? tooBig.code : null,
+      tooBigMessageCarriesBound: !!tooBig && tooBig.message.includes(String(SKILL_INSTANCE_MAX_BYTES)),
+      enabled: state,
+      rootConsistent: instanceAbs === SKILL_INSTANCE_ROOT + '/k-cap/k-skill.skill',
+      instanceAtPublicPath: files.has(instanceRel),
+      markerAtPublicName: !!marker,
+      markerHashMatchesPublicSha: !!(marker && marker.skills && marker.skills[0]
+        && marker.skills[0].sourceHash === await sha256Hex(new TextEncoder().encode(text))),
+    };
   }
 
   // ============ I. two instances: config + task state never cross ============

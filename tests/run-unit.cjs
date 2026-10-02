@@ -24,6 +24,9 @@ const SUITES = [
   // public-entry contract surface (M3b review R1: the descriptor validators
   // and the skill-instance contract data real Product consumers read)
   'public-entry-contracts.test.mjs',
+  // consumer lifecycle verdict logic (M3b review R1 F2: the shared key
+  // assertions the tarball consumer gate and the fault self-proof both run)
+  'consumer-lifecycle-verdict.test.mjs',
   // extracted task/provider/replay modules (real ESM since M1a/M2b)
   'task-runner.test.mjs',
   'provider-session.test.mjs',

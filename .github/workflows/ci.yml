@@ -84,10 +84,17 @@ jobs:
           cp locus-harness-*.tgz "$CONSUMER_DIR/locus-harness.tgz"
           cp tools/consumer-e2e/package.json "$CONSUMER_DIR/"
           cp tools/consumer-e2e/index.html "$CONSUMER_DIR/"
+          cp tools/consumer-e2e/faults.html "$CONSUMER_DIR/"
           cp tools/consumer-e2e/vite.config.js "$CONSUMER_DIR/"
           cp tools/consumer-e2e/consumer-main.js "$CONSUMER_DIR/consumer-main.js"
+          cp tools/consumer-e2e/consumer-faults-main.js "$CONSUMER_DIR/consumer-faults-main.js"
+          # the shared lifecycle verdict + scenario (normal gate and fault
+          # self-proof MUST run the same assertions — no divergent copies)
+          cp tools/consumer-e2e/lifecycle-verdict.js "$CONSUMER_DIR/lifecycle-verdict.js"
+          cp tools/consumer-e2e/lifecycle-scenario.js "$CONSUMER_DIR/lifecycle-scenario.js"
           mkdir -p "$CONSUMER_DIR/tests"
           cp tools/consumer-e2e/e2e-consumer.cjs "$CONSUMER_DIR/tests/e2e-consumer.cjs"
+          cp tools/consumer-e2e/e2e-consumer-faults.cjs "$CONSUMER_DIR/tests/e2e-consumer-faults.cjs"
           cp tests/helpers/chrome.cjs "$CONSUMER_DIR/tests/chrome-helper.cjs"
           echo "CONSUMER_DIR=$CONSUMER_DIR" >> "$GITHUB_ENV"
           echo "consumer assembled at: $CONSUMER_DIR"
@@ -109,7 +116,7 @@ jobs:
       - name: build the consumer with its own tooling
         working-directory: ${{ env.CONSUMER_DIR }}
         run: npx vite build
-      - name: serve + run the consumer browser gate (gates A–J)
+      - name: serve + run the consumer browser gate (gates A–J+K)
         working-directory: ${{ env.CONSUMER_DIR }}
         run: |
           CHROME=$(which google-chrome || which chromium || true)
@@ -120,3 +127,14 @@ jobs:
             sleep 0.5
           done
           node tests/e2e-consumer.cjs
+      # M3b review R1 (F2): the same built consumer runs the lifecycle fault
+      # self-proof — the shared verdict must pass the clean control and
+      # reject each directed fault (early ended / early admission / early
+      # task_end). A wedged fault fails its labeled bounded timeout, never
+      # the CI wait.
+      - name: run the consumer lifecycle fault self-proof (same build, shared verdict)
+        working-directory: ${{ env.CONSUMER_DIR }}
+        run: |
+          CHROME=$(which google-chrome || which chromium || true)
+          export CHROME
+          node tests/e2e-consumer-faults.cjs

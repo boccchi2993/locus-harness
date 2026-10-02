@@ -37,7 +37,11 @@ function resourceVerdict(names) {
     const name = full.replace(/^https?:\/\/[^/]+\//, '');
     if (name === '' || name === 'index.html') { allowed.push('index.html'); continue; }
     if (name === 'favicon.ico') { allowed.push(name); continue; } // browser-automatic
-    if (/^assets\/index-[A-Za-z0-9_-]+\.js$/.test(name)) { allowed.push(name); continue; }
+    // The consumer's OWN build output: content-hashed chunks under assets/
+    // (the entry chunk plus the shared lifecycle-scenario chunk both pages
+    // import since the M3b-R1 fault self-proof). Anything else — a foreign
+    // origin's script, a bare source file, a CDN asset — violates.
+    if (/^assets\/[A-Za-z0-9_-]+\.js$/.test(name)) { allowed.push(name); continue; }
     violations.push(name);
   }
   return { allowed, violations };
@@ -76,12 +80,24 @@ async function main() {
       JSON.stringify(r.B));
 
     // ---- C ----
-    check('C TaskRunner prepare→run→cancel with exactly-once termination',
-      r.C.prepareStartedRun === true && r.C.endsBeforeCancel === 0
-      && r.C.outcomeReason === 'cancelled' && r.C.exactlyOneEnd === true
-      && r.C.admissionReopenedAfterBoundary === true && r.C.outcome2Reason === 'rejected'
-      && r.C.startEvents === 1,
-      JSON.stringify(r.C));
+    // (M3b review R1, F2) The gate runs the SHARED lifecycle verdict — the
+    // exact same key assertions the fault self-proof page must fail.
+    check('C cancel around a PARKED run: the shared lifecycle verdict passes',
+      r.C.verdict && r.C.verdict.pass === true,
+      JSON.stringify(r.C && r.C.verdict && r.C.verdict.failures));
+    check('C boundary facts: entered, pre-release unsettled/closed, post-release settled once',
+      r.C.observation && r.C.observation.entered === true
+      && r.C.observation.preRelease.endedSettled === false
+      && r.C.observation.preRelease.taskEndPublished === false
+      && r.C.observation.preRelease.secondSubmitAccepted === false
+      && r.C.observation.preRelease.runExited === false
+      && r.C.observation.postRelease.endedReason === 'cancelled'
+      && r.C.observation.postRelease.taskStartCount === 1
+      && r.C.observation.postRelease.taskEndCount === 1
+      && r.C.observation.postRelease.runExited === true
+      && r.C.observation.postRelease.admissionReopened === true
+      && r.C.observation.postRelease.followUpReason === 'rejected',
+      JSON.stringify(r.C && r.C.observation));
 
     // ---- D ----
     check('D memory store + REAL adapter + REAL validators restore',
@@ -125,6 +141,20 @@ async function main() {
       JSON.stringify(r.H1));
     check('H2 capability composition rejection path (traversal payload fails loudly)',
       r.H2.rejectCode === 'extension_resolution_failed', JSON.stringify(r.H2));
+
+    // ---- K (M3b review R1, F1) ----
+    check('K entry validators: legal descriptors normalize, illegal ones fail with the real codes',
+      r.K.capNormalized === true && r.K.skillNormalized === true && r.K.mcpNormalized === true
+      && r.K.badPluginCode === 'extension_descriptor_invalid'
+      && r.K.badSkillCode === 'extension_descriptor_invalid',
+      JSON.stringify(r.K));
+    check('K skill contract agrees with the REAL manager products (path, marker, byte bound, hash)',
+      r.K.enabled === 'ready' && r.K.rootConsistent === true
+      && r.K.instanceAtPublicPath === true && r.K.markerAtPublicName === true
+      && r.K.tooBigCode === 'extension_descriptor_invalid'
+      && r.K.tooBigMessageCarriesBound === true
+      && r.K.markerHashMatchesPublicSha === true,
+      JSON.stringify(r.K));
 
     // ---- I ----
     check('I two instances: configs, histories, runners and events never cross',
