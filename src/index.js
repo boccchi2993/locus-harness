@@ -26,9 +26,11 @@ import { TASK_OUTCOME_REASONS } from './task-runner.js';
 import { AgentSession, HISTORY_BUDGET_BYTES, MAX_TOOL_ITERATIONS } from './agent.js';
 import { ApprovalController, APPROVAL_KINDS } from './approval.js';
 import { ModelCapabilityRegistry } from './capabilities.js';
+import { CapabilityManager } from './extension-composition.js';
 export { AgentSession, HISTORY_BUDGET_BYTES, MAX_TOOL_ITERATIONS };
 export { ApprovalController, APPROVAL_KINDS };
 export { ModelCapabilityRegistry };
+export { CapabilityManager };
 
 // ---------- task lifecycle ----------
 export {
@@ -81,7 +83,7 @@ export function createCapabilityManager(opts) {
 
 // ---------- capability composition core ----------
 export {
-  CapabilityManager, SkillSourceStore, pythonExtensionKeyOf,
+  SkillSourceStore, pythonExtensionKeyOf,
   validatePluginPayload, registerPluginRuntimeProvider,
   EXTENSION_ID_PATTERN, EXTENSION_PY_MODULE_PATTERN,
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
