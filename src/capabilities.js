@@ -259,6 +259,22 @@ class ModelCapabilityRegistry {
   }
 }
 
+// Base64 helper. M3b provenance: extracted verbatim from the SOURCE
+// repository's src/attachments.js at 2aec76e (the classic page's lexical
+// chain supplied it to the probe; the package owns its own copy now —
+// Node hosts get the Buffer path, browsers the btoa chunked path).
+function uint8ToBase64(bytes) {
+  if (typeof Buffer !== 'undefined' && Buffer.from) {
+    return Buffer.from(bytes).toString('base64');
+  }
+  var CHUNK = 0x8000;
+  var out = [];
+  for (var i = 0; i < bytes.length; i += CHUNK) {
+    out.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(out.join(''));
+}
+
 // ---------- deterministic model-facing notices (spec: one domain helper) ----------
 // One notice per outcome — callers must not hand-write per-site strings.
 // Model-facing text is stable; UI can show richer reasons from the gate

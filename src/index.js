@@ -75,6 +75,10 @@ export function createModelCapabilityRegistry(opts) {
   return new ModelCapabilityRegistry(opts);
 }
 
+export function createCapabilityManager(opts) {
+  return new CapabilityManager(opts);
+}
+
 // ---------- capability composition core ----------
 export {
   CapabilityManager, SkillSourceStore, pythonExtensionKeyOf,

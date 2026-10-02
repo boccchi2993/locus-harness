@@ -667,3 +667,6 @@ export {
   createProviderIdentity, createCredentialIdentity,
   projectNormalizedHistory, rawReplayIdentityCompatible,
 };
+// detectDialect is package-internal surface consumed by the in-package
+// model suites only — NOT part of the public entry.
+export { detectDialect };
