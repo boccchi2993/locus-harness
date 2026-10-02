@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>locus-harness consumer — lifecycle fault self-proof</title>
+</head>
+<body>
+<!--
+  Fault SELF-PROOF page (M3b review round 1, F2 step 3). Built by the
+  consumer's own Vite from the public entry import only — the same
+  isolation as the normal consumer page. It runs the SHARED lifecycle
+  scenario four times over the real packaged createTaskRunner: one clean
+  control and three directed test-side faults. The gate is the SHARED
+  verdict: the control must PASS it and every fault must be REJECTED by
+  its expected key assertion (an ineffective injection is a failure of
+  the proof, never a detection success). Production code carries no test
+  switch — the faults are wrappers around the real surface.
+-->
+<script type="module" src="./consumer-faults-main.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "locus-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Locus Harness — model-driven agent execution and orchestration: agent loop, model protocol and transport, task lifecycle, approval semantics, capability composition, image capability gate, provider replay validation.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort",
+    "test": "node tests/run-unit.cjs",
+    "test:e2e": "node tests/e2e.cjs"
+  },
+  "devDependencies": {
+    "vite": "^6.0.7"
+  }
+}
