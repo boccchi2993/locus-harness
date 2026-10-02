@@ -202,6 +202,13 @@ function resolveRel(fromRel, spec) {
     'pythonExtensionKeyOf', 'validatePluginPayload', 'registerPluginRuntimeProvider',
     'EXTENSION_ID_PATTERN', 'EXTENSION_PY_MODULE_PATTERN',
     'CAPABILITY_CATALOG', 'PLUGIN_CATALOG', 'SKILL_CATALOG', 'MCP_CATALOG',
+    // M3b review R1 (F1): the descriptor validators and the skill-instance
+    // contract data with real Product consumers at 2aec76e
+    // (capability-package.js, extensions.js) — see EXTRACTION-PLAN §3.
+    'validateCapabilityDescriptor', 'validatePluginDescriptor',
+    'validateSkillDescriptor', 'validateMcpDescriptor',
+    'skillInstancePath', 'SKILL_INSTANCE_ROOT', 'SKILL_INSTANCE_MARKER',
+    'SKILL_INSTANCE_MAX_BYTES', 'sha256Hex',
     'harnessCapabilities', 'ensureHarnessCore',
   ];
   const missing = requiredExports.filter((name) =>

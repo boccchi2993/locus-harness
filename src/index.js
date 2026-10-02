@@ -89,6 +89,30 @@ export {
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
 } from './extension-composition.js';
 
+// ---------- public descriptor + skill-instance contract (M3b review R1) ----------
+// The first-round review audit (EXTRACTION-PLAN §3) found real Product
+// consumers of the composition contract that the extraction had left on the
+// classic lexical chain and OUT of the public surface: capability-package.js
+// normalizes bundle descriptors through the four REAL validators and reads
+// the byte bound at module init (its 256 KiB skill contract), and
+// extensions.js validates instance paths against skillInstancePath /
+// SKILL_INSTANCE_ROOT, hides and refuses the Harness-owned install marker,
+// and hashes instance bytes with sha256Hex. These re-exports surface the
+// ORIGINAL authoritative definitions (no copies): a consumer that must agree
+// with the manager's products — materialized instance paths, the marker
+// name, the size bound, descriptor validity, source hashes — reads them
+// here, the same values the manager itself uses.
+export {
+  validateCapabilityDescriptor, validatePluginDescriptor,
+  validateSkillDescriptor, validateMcpDescriptor,
+  skillInstancePath, SKILL_INSTANCE_ROOT, SKILL_INSTANCE_MARKER,
+  SKILL_INSTANCE_MAX_BYTES, sha256Hex,
+} from './extension-composition.js';
+// Deliberately NOT an entry export: SKILL_DIFF_MAX_CHARS bounds the
+// approval-card diff detail — Product presentation policy with no Harness
+// consumer (only extensions.js reads it). It moves INTO the Product at M3c
+// (EXTRACTION-PLAN §3 caller table), it is not published here.
+
 // Constant accessors (the M2b entry surfaced the two core constants as
 // functions because they resolved lazily through the core table; they
 // are static module constants here, and the accessor form is kept for

@@ -21,6 +21,9 @@ const SUITES = [
   'image-probe.test.mjs',
   // capability composition core
   'capability-composition.test.mjs',
+  // public-entry contract surface (M3b review R1: the descriptor validators
+  // and the skill-instance contract data real Product consumers read)
+  'public-entry-contracts.test.mjs',
   // extracted task/provider/replay modules (real ESM since M1a/M2b)
   'task-runner.test.mjs',
   'provider-session.test.mjs',

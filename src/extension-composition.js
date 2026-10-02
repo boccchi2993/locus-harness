@@ -999,5 +999,5 @@ export {
   validatePluginDescriptor, validateSkillDescriptor, validateMcpDescriptor,
   validateCapabilityDescriptor, validateCatalogSet,
   CAPABILITY_STATES, MCP_STATES, SKILL_INSTANCE_ROOT, skillInstancePath,
-  SKILL_INSTANCE_MAX_BYTES, PLUGIN_RUNTIMES, sha256Hex,
+  SKILL_INSTANCE_MARKER, SKILL_INSTANCE_MAX_BYTES, PLUGIN_RUNTIMES, sha256Hex,
 };
