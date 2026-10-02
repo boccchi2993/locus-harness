@@ -1,11 +1,13 @@
 {
   "name": "locus-harness-tarball-consumer",
-  "version": "0.1.0",
   "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "description": "Consumer harness for the packaged locus-harness tarball. SOURCES ONLY - CI assembles a copy under RUNNER_TEMP, installs the real tarball there, and runs gates A-J in headless Chrome; the consumer instance never runs inside the locus-harness checkout.",
   "scripts": {
     "build": "vite build"
+  },
+  "dependencies": {
+    "locus-harness": "./locus-harness.tgz"
   },
   "devDependencies": {
     "vite": "^6.0.7"
