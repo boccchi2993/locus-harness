@@ -69,23 +69,54 @@ Product files audited: `src/ui/store.js`, `src/main.js`, `src/extensions.js`,
 `src/product/core-compatibility.js`, `src/product/tool-adapter.js`,
 `src/ui/product-prompt.js`.
 
-Via the harness ENTRY (module imports):
+### 3a. Via the harness ENTRY (module imports)
 
 | Consumer | Imports |
 |---|---|
 | `src/ui/store.js` | `createAgentSession, createApprovalController, createModelClient, historyBudgetBytes, createModelCapabilityRegistry, createImageInputGate, runImageInputProbe, classifyImageProviderError, imageInputUnavailableNotice, harnessCapabilities` + `createTaskRunner, isPersistenceFailure` (task-runner) + `createProviderSessions` (provider-session) |
 | `src/main.js` | `harnessCapabilities` |
 
-Via classic GLOBALS (the interface gap this extraction surfaces — the entry
-exports all of them, but the Product store has not switched yet):
+### 3b. The COMPLETE caller table (R1 revision — M3b review round 1)
 
-| Consumer | Global reads today | Public export ready |
-|---|---|---|
-| `src/ui/store.js` | `getProviderAdapter, createProviderIdentity, createCredentialIdentity, projectNormalizedHistory, CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG` | all exported from `src/index.js` |
-| `src/extensions.js`, `src/capability-package.js` | `EXTENSION_ID_PATTERN, SKILL_INSTANCE_MAX_BYTES` (composition constants through the classic lexical chain) | both exported from `src/index.js` |
-| `src/persistence.js` | `globalThis.__LOCUS_HARNESS_REPLAY_VALIDATION__` (one-way delegates) | `validateReplayPrefix` / `validateNormalizedPrefix` / `replayValidationError` are entry exports; the delegates must become imports in M3c |
+The original M3b audit derived the table below from the OLD core-table/entry
+publish list alone and MISSED real consumers: the classic lexical chain
+resolves top-level `const`/`function` names that were never published to
+globalThis and never appeared in the M2c `__LOCUS_HARNESS_CORE__` table —
+that is exactly how descriptors validators and the skill-instance contract
+stayed out of the public surface while the M3b text claimed full coverage.
+The R1 audit walked every cross-file free identifier of the Product files
+against the harness-owned definitions. First-failure evidence for the
+missing exports is in docs/M3B-VERIFICATION.md §1; the surface is pinned by
+`tests/public-entry-contracts.test.mjs` (public entry only) and consumer
+gate K (named imports from the tarball).
 
-Export-surface decisions with consumer evidence:
+| Symbol (defined in `src/extension-composition.js` unless noted) | Real caller at 2aec76e | Ownership | Public access on this branch |
+|---|---|---|---|
+| `validateCapabilityDescriptor` | `capability-package.js:292` (`normalizeDescriptor`) | Harness — THE descriptor schema; the package layer normalizes through it, never re-implements | entry export (R1) |
+| `validatePluginDescriptor` | `capability-package.js:293` | Harness | entry export (R1) |
+| `validateSkillDescriptor` | `capability-package.js:294` | Harness | entry export (R1) |
+| `validateMcpDescriptor` | `capability-package.js:295` | Harness | entry export (R1) |
+| `SKILL_INSTANCE_MAX_BYTES` | `capability-package.js:63` (read at MODULE INIT — the package's 256 KiB skill contract); `extensions.js:293–295` (mutation bound) | Harness contract — `SkillSourceStore.define` enforces the same bound | entry export (R1) |
+| `skillInstancePath` | `extensions.js:222, 247, 317` (instance identity checks + approval labels) | Harness — the path IS the instance identity the manager materializes | entry export (R1) |
+| `SKILL_INSTANCE_ROOT` | `extensions.js:222–223, 344, 390` | Harness — the instance tree root | entry export (R1) |
+| `SKILL_INSTANCE_MARKER` | `extensions.js:218, 327` (hidden from `list()`, refused for mutation — Harness-owned metadata) | Harness — install-marker lifecycle | entry export (R1; the constant also gained its module export at R1) |
+| `sha256Hex` | `extensions.js:359–442` (TOCTOU before/after hashes, no-op-write detection); `capability-package.js:934` (bundle integrity) | Harness-defined helper shared with the Product — the definition lives in the composition core and both sides must hash identically | entry export (R1) — the ORIGINAL implementation, no copy |
+| `EXTENSION_ID_PATTERN` | `extensions.js:221`; `capability-package.js:490` | Harness | entry export since M3b |
+| `CapabilityManager`, `SkillSourceStore`, `CAPABILITY_CATALOG`, `PLUGIN_CATALOG`, `SKILL_CATALOG`, `MCP_CATALOG` | `store.js:95–103` | Harness | entry exports since M3b |
+| `getProviderAdapter`, `createProviderIdentity`, `createCredentialIdentity`, `projectNormalizedHistory` | `store.js:650–696, 978–979, 1385` | Harness (`model-adapters.js`) | entry exports since M3b |
+| `validateReplayPrefix` / `validateNormalizedPrefix` / `replayValidationError` | `persistence.js:186–202` (one-way delegates over the deleted `__LOCUS_HARNESS_REPLAY_VALIDATION__`) | Harness | entry exports since M3b; the delegates become imports at M3c |
+| `harnessCapabilities` | `store.js:61, 280`; `main.js:27` | Harness | entry export since M3b |
+| `SKILL_DIFF_MAX_CHARS` | `extensions.js:283, 417` (approval-card diff length bound) | **Product presentation policy** — no Harness consumer reads it; the constant merely lived in the composition file | deliberately NOT exported — M3c moves the constant INTO Product `extensions.js` (value and fail-closed semantics unchanged) |
+
+Not Harness symbols (found by the same walk, kept out of this package):
+`WorkspaceAdapter`, `normalizeWorkspacePath`, `vfsError` / `vfsNotFound` /
+`vfsReadOnly` are Runtime surface (`workspace.js` / `vfs.js`); the Product
+continues to take them from the Runtime at M3c. `StaticFileWorkspace`,
+`SkillInstanceStorage`, `SkillInstanceWorkspace`, `productTaskVfsMounts`
+are Product-local (`extensions.js`). Runtime visibility of this split is
+enforced by boundary B1/B2.
+
+### 3c. Export-surface decisions with consumer evidence
 
 - Kept as public factories (existing callers): `createAgentSession`,
   `createApprovalController`, `createModelClient`, `createModelCapabilityRegistry`,
@@ -96,14 +127,27 @@ Export-surface decisions with consumer evidence:
   `AgentSession`, `ApprovalController`, `ModelCapabilityRegistry`,
   `CapabilityManager` — real consumers exist (tests-as-hosts construct them;
   a standalone host may too).
-- Package-internal (module exports, NOT entry exports), consumers are the
-  in-package suites only: `parseToolCall`, `stripInternalFields`, `truncateFor`
-  (agent.test), `ApprovalError`, `ApprovalBusyError` (approval.test),
-  `detectDialect` (model.test), `makeHttpError` (image-probe.test),
-  `generateProbePng`, `PROBE_*`, `isImageUnsupportedProviderError`
-  (image-probe.test), descriptor validators/constants
-  (capability-composition.test). `rawReplayIdentityCompatible` and
-  `PLUGIN_RUNTIMES`/`sha256Hex` etc. are module exports for the same reason.
+- **Entry exports with REAL Product consumers (R1 correction):** the four
+  descriptor validators, `skillInstancePath`, `SKILL_INSTANCE_ROOT`,
+  `SKILL_INSTANCE_MARKER`, `SKILL_INSTANCE_MAX_BYTES` and `sha256Hex`. The
+  M3b text below claimed these were consumed by "the in-package suites
+  only" and that the entry already exported them — both statements were
+  wrong: the callers in §3b are Product code, and the entry did not even
+  re-export them (a static named import failed at module linkage; see
+  docs/M3B-VERIFICATION.md §1). Fixed and pinned at R1.
+- Still package-internal (module exports, consumers are the in-package
+  suites only — re-verified at R1, no Product caller found):
+  `parseToolCall`, `stripInternalFields`, `truncateFor` (agent.test),
+  `ApprovalError`, `ApprovalBusyError` (approval.test), `detectDialect`
+  (model.test), `makeHttpError` (image-probe.test), `generateProbePng`,
+  `PROBE_*`, `isImageUnsupportedProviderError` (image-probe.test),
+  `validateCatalogSet`, `CAPABILITY_STATES`, `MCP_STATES`, `PLUGIN_RUNTIMES`,
+  `pluginRuntimeProvider`, `unregisterPluginRuntimeProvider`.
+  (`rawReplayIdentityCompatible` is an ENTRY export since M3b — the M3b
+  text mislisted it as internal; it stays a public export because it is
+  provider-replay surface consumed alongside the replay validators.)
+  The remaining internals surface through the entry only if a real
+  consumer appears — never to pad the export list.
 - No `./src/*` wildcard in the package `exports` map — consumers get exactly
   `.` (pinned by harness-boundary B3).
 
