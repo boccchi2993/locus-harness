@@ -141,13 +141,22 @@ the corrected driver re-ran green.
   green) — unchanged dependency, not re-run.
 - Source-repo Product/Runtime/joint suites — outside Harness scope (see
   TEST-COVERAGE-MAP "Historical gates"); the M3c switch re-runs them.
-- PR CI browser-readiness first-failures of the M3b push (two runs, same
-  pattern: CDP readiness timeout before any assertion, zero-change rerun
-  green, cause undetermined) — NOT re-diagnosed this round; no new
-  occurrence in the local browser gates above; no timeout was loosened and
-  no automatic retry was added. The first-fail logs remain with the M3b
-  delivery record; the final CI run of THIS push is the authoritative
-  re-verification.
+- M3b push CI readiness first-failures (two runs, same pattern, zero-change
+  rerun green, cause undetermined) — NOT re-diagnosed; no timeout loosened,
+  no automatic retry added.
+- **This round's push CI had the SAME first failure once** (run
+  37035992173, attempt 1, consumer job): `CDP browser endpoint unavailable:
+  readiness timeout, phase=cdp elapsedMs=15033` — BEFORE any gate
+  assertion, Chrome alive with DevTools listening, `/json/version`
+  aborted; `0 passed, 1 failed` is the harness's own bounded readiness
+  failure, not a gate check. Cause undetermined (no new evidence; the same
+  head's pull_request run passed all four jobs, and an intentional
+  `rerun --failed` of attempt 1 — zero changes — passed everything,
+  consumer gate 20/20 and the new self-proof step 9/9 included). The
+  rerun success proves only that attempt; the first failure stands
+  recorded, nothing was loosened and no automatic retry exists in CI.
+  Logs: attempt-1 (failure) and attempt-2 (success) retained with the
+  delivery record.
 
 ## 6. Remaining M3c items (explicitly deferred, with concrete paths)
 
