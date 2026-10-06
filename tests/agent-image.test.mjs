@@ -1,0 +1,512 @@
+// AgentSession image-input integration tests (node, fake model client).
+// Exercises the model-input boundary: gate runs only when images are about
+// to enter a request, history stays semantic (no base64), the consumer
+// contract's final liveness check prevents dead-task side effects, notices
+// are deterministic, the per-run gate ask happens once, and the transport
+// budget counts resolved image payloads. Also drives the FULL unknown→Yes
+// flow through the real ApprovalController + registry.
+// M3b migration: verbatim from the source repository at 2aec76e
+// (tests/agent-image.test.cjs, blob 708d33444d139da1e1d610c138df20c2379b49a4)
+// with the ASSEMBLY converted and every assertion unchanged: the Product
+// IDB persistence service and the Product AttachmentStore became the
+// in-memory doubles below, which reproduce EXACTLY the narrow contracts
+// this suite exercises — the registry's { get, put, delete } triple and
+// the attachment store's ingest/resolveForWire + external byte
+// corruption surface with the real SHA-256 and the real
+// AttachmentIntegrityError shapes (name/code/reason). No IDB/OPFS moved
+// into the package.
+// Run: node tests/agent-image.test.mjs
+
+import { AgentSession } from '../src/agent.js';
+import { ApprovalController } from '../src/approval.js';
+import {
+  ModelCapabilityRegistry, createImageInputGate, imageInputUnavailableNotice,
+} from '../src/capabilities.js';
+
+// --- in-memory persistence triple (the registry's narrow port) ---
+class MemoryPersistence {
+  constructor() { this._stores = new Map(); this._attachmentBytes = new Map(); }
+  _store(name) { if (!this._stores.has(name)) this._stores.set(name, new Map()); return this._stores.get(name); }
+  async get(name, key) { const s = this._store(name); return s.has(key) ? s.get(key) : null; }
+  async put(name, row) { this._store(name).set(row.key || row.id, row); return row; }
+  async delete(name, key) { this._store(name).delete(key); }
+  // durable attachment bytes (the surface the real PersistenceService
+  // exposes and the product AttachmentStore delegates to)
+  async readAttachmentBytes(sha) { const b = this._attachmentBytes.get(sha); return b ? new Uint8Array(b) : null; }
+  async writeAttachmentBytes(sha, bytes) { this._attachmentBytes.set(sha, new Uint8Array(bytes)); }
+}
+
+// --- in-memory attachment store double ---
+// Reproduces the product AttachmentStore contract this suite drives:
+//   ingestImage({ bytes, name, declaredType }) → record { id, mimeType, sha256, size }
+//   resolveForWire(id) → { mimeType, dataBase64 } | null, THROWS the
+//     integrity error (name 'AttachmentIntegrityError', code
+//     'attachment_integrity_error', reason 'hash_mismatch') when the
+//     durable bytes no longer match their SHA-256;
+//   readAttachmentBytes / writeAttachmentBytes — the external corruption
+//     surface the suite uses to flip a durable bit behind live metadata.
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+class MemoryAttachmentStore {
+  // bytes live in the persistence service (the real store delegates the
+  // same way); metadata is the store's own index
+  constructor(opts) {
+    this._persistence = opts && opts.persistence;
+    this._meta = new Map();      // id → record
+    this._bySha = new Map();     // sha256 → id
+  }
+  async ingestImage(spec) {
+    const sha = await sha256Hex(spec.bytes);
+    if (!this._bySha.has(sha)) {
+      const id = 'att-' + sha.slice(0, 12);
+      await this._persistence.writeAttachmentBytes(sha, spec.bytes);
+      this._bySha.set(sha, id);
+      this._meta.set(id, { id, mimeType: spec.declaredType, sha256: sha, size: spec.bytes.byteLength, name: spec.name });
+    }
+    return this._meta.get(this._bySha.get(sha));
+  }
+  async resolveForWire(id) {
+    const rec = this._meta.get(id);
+    if (!rec) return null;
+    const stored = await this._persistence.readAttachmentBytes(rec.sha256);
+    if (!stored) return null;
+    if ((await sha256Hex(stored)) !== rec.sha256) {
+      const e = new Error('attachment bytes failed SHA-256 verification');
+      e.name = 'AttachmentIntegrityError';
+      e.code = 'attachment_integrity_error';
+      e.reason = 'hash_mismatch';
+      throw e;
+    }
+    let binary = '';
+    for (let i = 0; i < stored.length; i++) binary += String.fromCharCode(stored[i]);
+    return { mimeType: rec.mimeType, dataBase64: btoa(binary) };
+  }
+}
+
+let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => [
+    { name: 'bash', description: 'local shell', inputSchema: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } },
+    { name: 'cloud_bash', description: 'remote shell', inputSchema: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } },
+  ].slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
+function check(name, cond, detail) {
+  if (cond) { passed++; console.log('PASS ' + name); }
+  else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const SENTINEL_TEXT = 'sentinel-pixel-payload-0001';
+const SENTINEL_B64 = Buffer.from(SENTINEL_TEXT).toString('base64');
+const IMAGE_PART = { type: 'image', attachmentId: 'att_1', mimeType: 'image/png', sha256: 'aa11', size: SENTINEL_TEXT.length };
+const RICH_CONTENT = [{ type: 'text', text: '看这张图' }, IMAGE_PART];
+
+const FINAL_ENVELOPE = {
+  content: 'done', reasoning: null, reasoningType: null, toolCalls: null,
+  rawMessage: { role: 'assistant', content: 'done' }, stopReason: 'stop',
+  usage: null, providerMetadata: null, truncated: false,
+};
+const TOOL_ENVELOPE = {
+  content: '', reasoning: null, reasoningType: null,
+  toolCalls: [{ id: 'call-1', name: 'bash', input: { input: 'ls' } }],
+  rawMessage: { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'bash', arguments: '{"input":"ls"}' } }] },
+  stopReason: 'tool_calls', usage: null, providerMetadata: null, truncated: false,
+};
+
+function makeHarness(imageInput, modelClient) {
+  const events = [];
+  const modelCalls = [];
+  const session = new AgentSession({
+    modelClient: modelClient || (async (body) => {
+      modelCalls.push(body);
+      return FINAL_ENVELOPE;
+    }),
+    toolPort: asToolPort(async () => ({ output: 'tool-out', success: true, backend: 'browser' })),
+    buildSystemPrompt: () => 'SYSTEM',
+    emit: (e) => events.push(e),
+    imageInput,
+  });
+  return { session, events, modelCalls };
+}
+
+async function runRich(session, opts) {
+  await session.run('看这张图', Object.assign({ userContent: RICH_CONTENT }, opts || {}));
+}
+
+async function main() {
+  const identity = {
+    provider: 'anthropic', adapterId: 'anthropic-compatible', dialect: 'anthropic',
+    endpointIdentity: 'https://gateway.example/anthropic', model: 'test-model', protocolVersion: 'messages-v1',
+  };
+
+  // ---------- CASE A: known supported ----------
+  {
+    const gateCalls = [];
+    const imageInput = {
+      ensureCapability: async (o) => { gateCalls.push(o); return { state: 'supported', source: 'user' }; },
+      resolveAttachment: async (id) => id === 'att_1' ? { mimeType: 'image/png', dataBase64: SENTINEL_B64 } : null,
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    check('A1 supported: exactly one provider request carrying the image bytes',
+      h.modelCalls.length === 1
+        && h.modelCalls[0].messages[0].content[1].type === 'image'
+        && h.modelCalls[0].messages[0].content[1].dataBase64 === SENTINEL_B64
+        && h.modelCalls[0].messages[0].content[1].mimeType === 'image/png');
+    check('A1b history stays SEMANTIC: attachmentId kept, base64 never stored',
+      h.session.history[0].content[1].attachmentId === 'att_1'
+        && !JSON.stringify(h.session.history).includes(SENTINEL_B64));
+    check('A1c no base64 reaches the event stream',
+      !h.events.some((e) => JSON.stringify(e).includes(SENTINEL_B64)));
+    check('A1d task_start carries the image count; exactly one start/end',
+      h.events.filter((e) => e.type === 'task_start').length === 1
+        && h.events[0].images === 1
+        && h.events.filter((e) => e.type === 'task_end').length === 1);
+    check('A1e tool availability is independent of image capability (tools still advertised)',
+      Array.isArray(h.modelCalls[0].tools) && h.modelCalls[0].tools.length === 2);
+  }
+
+  // ---------- CASE B: known unsupported ----------
+  {
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'unsupported', source: 'user' }),
+      resolveAttachment: async () => { throw new Error('must not resolve when unsupported'); },
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    const sent = h.modelCalls[0].messages[0].content;
+    check('B1 unsupported: image absent, deterministic notice sent, text preserved',
+      !sent.some((p) => p.type === 'image')
+        && sent.some((p) => p.type === 'text' && p.text.includes('marked as not supporting image input'))
+        && sent[0].text === '看这张图');
+    check('B1b the task still completes normally (image absence is not a failure)',
+      h.events.some((e) => e.type === 'task_end' && e.reason === 'completed')
+        && h.events.some((e) => e.type === 'assistant_text'));
+    check('B1c tools remain advertised for text-only models',
+      Array.isArray(h.modelCalls[0].tools) && h.modelCalls[0].tools.length === 2);
+  }
+
+  // ---------- CASE C: unknown → Yes via the REAL ApprovalController ----------
+  {
+    const service = new MemoryPersistence();
+    await service.ready;
+    const registry = new ModelCapabilityRegistry({ persistence: service });
+    const approvals = new ApprovalController({ onChange() {}, onEvent() {} });
+    const gate = createImageInputGate({
+      registry, approvals,
+      runProbe: async () => ({ state: 'unknown', reason: 'unused' }),
+      identityOf: () => identity,
+    });
+    const imageInput = {
+      ensureCapability: (o) => gate.ensure(o),
+      resolveAttachment: async () => ({ mimeType: 'image/png', dataBase64: SENTINEL_B64 }),
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    const runPromise = runRich(h.session).catch(() => {});
+    while (!approvals.pending) await sleep(5);
+    check('C1 unknown image boundary suspends the SAME task on a capability card',
+      approvals.pending.kind === 'capability' && approvals.pending.action.type === 'image_input_capability');
+    approvals.resolve(approvals.pending.id, { outcome: 'confirm' });
+    await runPromise;
+    check('C1b Yes → same task resumes with exactly one image provider request',
+      h.modelCalls.length === 1
+        && h.modelCalls[0].messages[0].content[1].dataBase64 === SENTINEL_B64
+        && h.events.filter((e) => e.type === 'task_start').length === 1
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
+    const row = await registry.lookup(identity);
+    check('C1c the decision persisted to the capability registry (source user)',
+      row.state === 'supported' && row.source === 'user');
+    check('C1d the approval question never enters provider history',
+      !JSON.stringify(h.modelCalls).includes('image-capable') && !JSON.stringify(h.modelCalls).includes('Image capability'));
+    // Second run: registry answers — no second ask.
+    const h2 = makeHarness(imageInput);
+    await runRich(h2.session);
+    check('C1e the next run no longer asks (registry persisted)',
+      h2.modelCalls.length === 1 && h2.modelCalls[0].messages[0].content[1].type === 'image');
+  }
+
+  // ---------- CASE G: Yes → cancel TOCTOU (consumer contract) ----------
+  {
+    let resolveGate;
+    const gatePromise = new Promise((r) => { resolveGate = r; });
+    const imageInput = {
+      ensureCapability: () => gatePromise,
+      resolveAttachment: async () => {
+        // The "safe preparation" window: the decision arrived, the
+        // provider request has NOT begun. A cancel here must stop it.
+        h.session.cancel();
+        await sleep(5);
+        return { mimeType: 'image/png', dataBase64: SENTINEL_B64 };
+      },
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    const runPromise = runRich(h.session).catch(() => {});
+    resolveGate({ state: 'supported', source: 'user', decision: 'yes' });
+    await runPromise;
+    check('G1 cancel after Yes but before the request → zero provider side effects',
+      h.modelCalls.length === 0
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'cancelled'));
+  }
+
+  // ---------- Escape semantics: cancelled decision, task continues ----------
+  {
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'unknown', source: 'none', decision: 'cancelled' }),
+      resolveAttachment: async () => ({ mimeType: 'image/png', dataBase64: SENTINEL_B64 }),
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    const sent = h.modelCalls[0].messages[0].content;
+    check('E1 a cancelled capability question is NOT a No: image unsent, task continues',
+      h.modelCalls.length === 1 && !sent.some((p) => p.type === 'image')
+        && sent.some((p) => p.text && p.text.includes('cancelled'))
+        && h.events.some((e) => e.type === 'warning' && e.code === 'image_capability_cancelled')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
+  }
+
+  // ---------- per-run gate ask exactly once across a tool loop ----------
+  {
+    // The agent invokes ensureCapability per model request; the SAME
+    // askCache flows through the whole run, so a gate honoring it (as the
+    // real one does) is consulted exactly once.
+    let gateCalls = 0, cacheHits = 0;
+    const KEY = 'test-identity';
+    const imageInput = {
+      ensureCapability: async (o) => {
+        if (o.askCache && o.askCache.has(KEY)) { cacheHits++; return o.askCache.get(KEY); }
+        gateCalls++;
+        const out = { state: 'supported', source: 'user' };
+        if (o.askCache) o.askCache.set(KEY, out);
+        return out;
+      },
+      resolveAttachment: async () => ({ mimeType: 'image/png', dataBase64: SENTINEL_B64 }),
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    h.session.modelClient = async (body, opts) => {
+      h.modelCalls.push(body);
+      return h.modelCalls.length === 1 ? TOOL_ENVELOPE : FINAL_ENVELOPE;
+    };
+    await runRich(h.session);
+    check('L1 the run shares one askCache: gate consulted once, second turn served from cache',
+      gateCalls === 1 && cacheHits === 1 && h.modelCalls.length === 2
+        && h.modelCalls.every((b) => b.messages[0].content.some((p) => p.type === 'image' && p.dataBase64 === SENTINEL_B64)));
+    check('L1b history is never mutated by materialization',
+      !JSON.stringify(h.session.history).includes(SENTINEL_B64));
+  }
+
+  // ---------- missing durable bytes degrade honestly ----------
+  {
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'supported', source: 'user' }),
+      resolveAttachment: async () => null,
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    check('M1 vanished bytes → explicit warning + model told, no phantom image',
+      !h.modelCalls[0].messages[0].content.some((p) => p.type === 'image')
+        && h.modelCalls[0].messages[0].content.some((p) => p.text && p.text.includes('no longer available'))
+        && h.events.some((e) => e.type === 'warning' && e.code === 'image_attachment_missing')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
+  }
+
+  // ---------- F-I04: corrupted durable blob fails closed BEFORE the provider ----------
+  {
+    const service = new MemoryPersistence();
+    await service.ready;
+    const attStore = new MemoryAttachmentStore({ persistence: service });
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8]);
+    const rec = await attStore.ingestImage({ bytes: pngBytes, name: 'doomed.png', declaredType: 'image/png' });
+    // External corruption (bit flip) of the durable bytes behind live metadata.
+    const stored = await service.readAttachmentBytes(rec.sha256);
+    stored[5] ^= 0xFF;
+    await service.writeAttachmentBytes(rec.sha256, stored);
+
+    const fIdentity = {
+      provider: 'anthropic', adapterId: 'anthropic-compatible', dialect: 'anthropic',
+      endpointIdentity: 'https://gateway.example/anthropic', model: 'f-model', protocolVersion: 'messages-v1',
+    };
+    const registry = new ModelCapabilityRegistry({ persistence: service });
+    await registry.setUserDecision(fIdentity, 'supported');
+
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'supported', source: 'user' }),
+      resolveAttachment: (id) => attStore.resolveForWire(id),
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    // Reference the REAL record id — the corruption must be hit through
+    // the actual resolver, not the shared fixture's synthetic 'att_1'.
+    await h.session.run('看这张图', { userContent: [
+      { type: 'text', text: '看这张图' },
+      { type: 'image', attachmentId: rec.id, mimeType: rec.mimeType, sha256: rec.sha256, size: rec.size },
+    ] });
+    check('F1 (T4) corrupted durable blob → ZERO provider calls, fail closed with the integrity reason',
+      h.modelCalls.length === 0
+        && h.events.some((e) => e.type === 'error' && e.code === 'image_attachment_integrity' && e.reason === 'hash_mismatch')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'error'),
+      JSON.stringify(h.events.map((e) => e.type + ':' + (e.code || e.reason || ''))));
+    check('F1b the corruption never leaked into any event payload',
+      !h.events.some((e) => JSON.stringify(e).includes(Buffer.from(pngBytes).toString('base64'))));
+    const looked = await registry.lookup(fIdentity);
+    check('F2 (H) an integrity failure NEVER mutates the capability registry',
+      looked.state === 'supported' && looked.source === 'user', JSON.stringify(looked));
+  }
+
+  // ---------- non-integrity resolution errors still degrade honestly ----------
+  {
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'supported', source: 'user' }),
+      resolveAttachment: async () => { throw new Error('transient storage hiccup'); },
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    check('F3 non-integrity resolution failures keep the honest missing path (degrade + continue)',
+      h.modelCalls.length === 1
+        && !h.modelCalls[0].messages[0].content.some((p) => p.type === 'image')
+        && h.events.some((e) => e.type === 'warning' && e.code === 'image_attachment_missing')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
+  }
+
+  // ---------- transport budget counts resolved image payloads ----------
+  {
+    const h = makeHarness(null);
+    // Metadata-only accounting would be ~200 bytes; resolved base64 is 4/3
+    // of 900_000 → the request must exceed the 768 KiB transport budget.
+    h.session.history.push({ role: 'user', _taskStart: true, content: [
+      { type: 'text', text: 'x' },
+      { type: 'image', attachmentId: 'att_big', mimeType: 'image/png', size: 900000 },
+    ] });
+    let threw = null;
+    try { h.session.enforceHistoryBudget(null); } catch (e) { threw = e; }
+    check('P1 the transport budget counts the RESOLVED image payload (4/3 + framing)',
+      !!threw && /transport budget/.test(threw.message), threw && threw.message);
+    const small = makeHarness(null).session;
+    small.history.push({ role: 'user', _taskStart: true, content: [
+      { type: 'text', text: 'x' },
+      { type: 'image', attachmentId: 'att_small', mimeType: 'image/png', size: 1200 },
+    ] });
+    const withImage = await small.historyRequestBytes(null);
+    const withoutImage = await (async () => {
+      const s = makeHarness(null).session;
+      s.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'x' }] });
+      return s.historyRequestBytes(null);
+    })();
+    check('P1b budget math grows by ≈ size×4/3 (1200 → +1600+256 bytes, not metadata-size)',
+      withImage - withoutImage >= 1600 && withImage - withoutImage < 3000,
+      String(withImage - withoutImage));
+    // End-to-end: a run with an over-budget image fails loudly BEFORE any model call.
+    const big = makeHarness(null);
+    await big.session.run('x', { userContent: [
+      { type: 'text', text: 'x' },
+      { type: 'image', attachmentId: 'att_big', mimeType: 'image/png', size: 900000 },
+    ] });
+    check('P1c an over-budget image task fails with an explicit error, zero model calls',
+      big.modelCalls.length === 0
+        && big.events.some((e) => e.type === 'error' && e.code === 'history_budget')
+        && big.events.some((e) => e.type === 'task_end' && e.reason === 'error'));
+  }
+
+  // ---------- text-only regression: no imageInput, no images, no gate ----------
+  {
+    const h = makeHarness(null);
+    await h.session.run('plain text task');
+    check('T1 text-only sessions never touch the gate (unchanged baseline)',
+      h.modelCalls.length === 1 && h.modelCalls[0].messages[0].content === 'plain text task'
+        && h.events[0].images === undefined);
+  }
+
+  // ---------- M2c review round 2: the RUN-SCOPED image input binding ----------
+  // run() captures ONE image-input binding at entry: the gate consultation
+  // and every materialization of the task (current input, session history,
+  // restored history) use that one captured object. Default (no override)
+  // stays the session-level port, byte-for-byte the old behavior. The
+  // binding is PER TASK: a successor run never sees it, and the harness
+  // never reads anything but the port object itself.
+  {
+    const sessionLevelCalls = [];
+    const sessionLevel = {
+      ensureCapability: async (o) => { sessionLevelCalls.push(o); return { state: 'supported', source: 'user' }; },
+      resolveAttachment: async () => ({ mimeType: 'image/png', dataBase64: SENTINEL_B64 }),
+      unavailableNotice: imageInputUnavailableNotice,
+    };
+    const denyCalls = [];
+    const makeDeny = (into) => ({
+      ensureCapability: async (o) => { into.push(o); return { state: 'unsupported', source: 'task' }; },
+      resolveAttachment: async () => { throw new Error('must not resolve under the task denial'); },
+      unavailableNotice: () => 'Image input is disabled for this task: the harness does not declare the image input capability, so the image was not sent to the model.',
+    });
+    const h = makeHarness(sessionLevel);
+    // History carries an image from an EARLIER task of the same session.
+    h.session.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'earlier turn' }, IMAGE_PART] });
+    await h.session.run('text-only now', { imageInput: makeDeny(denyCalls) });
+    const sent = h.modelCalls[0].messages[0].content;
+    check('R1 the run-scoped binding governs BOTH the gate and the materialization (never the session port)',
+      denyCalls.length === 1 && sessionLevelCalls.length === 0
+        && !sent.some((p) => p.type === 'image')
+        && sent.some((p) => p.type === 'text' && p.text.includes('disabled for this task'))
+        && sent.some((p) => p.type === 'text' && p.text === 'earlier turn'),
+      JSON.stringify({ deny: denyCalls.length, session: sessionLevelCalls.length,
+        sent: sent.map((p) => p.type + ':' + String(p.text || '').slice(0, 40)) }));
+    check('R1b the binding received the run askCache; the task completed; history keeps the semantic ref',
+      denyCalls[0] && denyCalls[0].askCache instanceof Map
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed')
+        && h.session.history[0].content[1].attachmentId === 'att_1');
+    // Successor task, NO override: the session-level port again — no
+    // cross-task leak of the denial, the image crosses normally.
+    await h.session.run('images are back');
+    check('R2 the next run falls back to the session-level port (the denial never leaks across tasks)',
+      h.modelCalls.length === 2
+        && h.modelCalls[1].messages[0].content.some((p) => p.type === 'image' && p.dataBase64 === SENTINEL_B64)
+        && sessionLevelCalls.length === 1 && denyCalls.length === 1);
+    // Another task, a DIFFERENT binding object: per-task capture.
+    const deny2Calls = [];
+    await h.session.run('text-only again', { imageInput: makeDeny(deny2Calls) });
+    check('R3 each task binds its own override; a new decision object is captured fresh',
+      deny2Calls.length === 1 && denyCalls.length === 1 && sessionLevelCalls.length === 1
+        && !h.modelCalls[2].messages[0].content.some((p) => p.type === 'image'));
+  }
+  // ---------- the same captured binding across the tool loop ----------
+  {
+    const denyCalls = [];
+    const deny = {
+      ensureCapability: async (o) => { denyCalls.push(o); return { state: 'unsupported', source: 'task' }; },
+      resolveAttachment: async () => { throw new Error('must not resolve'); },
+      unavailableNotice: () => 'Image input is disabled for this task.',
+    };
+    const h = makeHarness(null); // NO session-level port at all
+    h.session.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'earlier' }, IMAGE_PART] });
+    h.session.modelClient = async (body) => {
+      h.modelCalls.push(body);
+      return h.modelCalls.length === 1 ? TOOL_ENVELOPE : FINAL_ENVELOPE;
+    };
+    await h.session.run('loop with a tool turn', { imageInput: deny });
+    check('R4 every model request of the task uses the SAME captured binding (tool turn included)',
+      h.modelCalls.length === 2 && denyCalls.length === 2
+        && denyCalls.every((o) => o && o.askCache === denyCalls[0].askCache)
+        && h.modelCalls.every((b) => !b.messages[0].content.some((p) => p.type === 'image')),
+      JSON.stringify({ calls: h.modelCalls.length, deny: denyCalls.length }));
+  }
+  console.log('---');
+  console.log('agent-image.test.cjs: ' + passed + ' passed, ' + failed + ' failed');
+  process.exit(failed ? 1 : 0);
+}
+
+main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });

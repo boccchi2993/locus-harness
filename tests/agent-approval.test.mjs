@@ -1,0 +1,378 @@
+// AgentSession × ApprovalController integration tests (node, NO DOM):
+// proves approval is a SUSPENSION of the same async task, not a task
+// boundary. The real AgentSession runs unchanged; the toolExecutor asks
+// the real ApprovalController with the task's AbortSignal, exactly the
+// seam a future image-gate / network / tool consumer will use.
+//
+//   run() → model → tool asks → PAUSE → human decides → SAME tool
+//   continuation resumes → tool_result → SAME session continues →
+//   final answer → exactly one task_end.
+//
+// The consumer below is the CANONICAL in-repo template of the
+// "Consumer execution contract" (docs/APPROVALS.md): an allow decision
+// authorizes the action, but task liveness is revalidated immediately
+// before the protected side effect — no await after that final check.
+//
+// M3b migration: verbatim from the source repository at 2aec76e
+// (tests/agent-approval.test.cjs, blob
+// 2ccc1199cd87c98a776bdf0c841d34dad9c0a6ff) with ONLY the loading
+// converted (eval → real ESM imports; the Product tool registry became
+// the verbatim test fixture); every assertion is unchanged.
+// Run: node tests/agent-approval.test.mjs
+
+import { AgentSession, buildSystemPrompt } from '../src/agent.js';
+import { ApprovalController } from '../src/approval.js';
+import { AGENT_TOOL_DEFINITIONS } from './fixtures/product-tool-registry.mjs';
+
+function envelope(text, extra) {
+  return Object.assign({
+    content: text,
+    reasoning: null,
+    stopReason: 'end_turn',
+    usage: null,
+    rawMessage: { role: 'assistant', content: text },
+    truncated: false,
+  }, extra || {});
+}
+const TOOL_CALL = envelope('```json\n{"tool":"bash","input":"ls"}\n```');
+const FINAL = envelope('done');
+
+let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
+function check(name, cond, detail) {
+  if (cond) { passed++; console.log('PASS ' + name); }
+  else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + JSON.stringify(detail).slice(0, 400) : '')); }
+}
+
+async function waitFor(cond, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 3000);
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return false;
+}
+
+// AbortSignal.throwIfAborted() when the runtime provides it; equivalent
+// fallback otherwise (docs/APPROVALS.md, "Consumer execution contract").
+function throwIfAborted(signal) {
+  if (!signal) return;
+  if (typeof signal.throwIfAborted === 'function') {
+    signal.throwIfAborted();
+    return;
+  }
+  if (signal.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error('Aborted');
+  }
+}
+
+function newController() {
+  const events = [];
+  const c = new ApprovalController({
+    onChange: () => {},
+    onEvent: (name, data) => events.push({ name, data }),
+  });
+  return { c, approvalEvents: events };
+}
+
+// Standard wiring: first model reply asks for the tool; the tool asks the
+// ApprovalController with the TASK's signal (the exact future consumer
+// shape); the decision routes to executed vs denied tool output. This is
+// the canonical consumer template — every approval→side-effect consumer in
+// the repo must keep this shape (docs/APPROVALS.md, consumer contract).
+function approvalSession(overrides) {
+  const { c, approvalEvents } = newController();
+  const state = {
+    modelCalls: 0, toolEntries: 0, decisions: [], sideEffects: 0,
+    // Optional barriers used by the TOCTOU regressions below. The
+    // pre-side-effect gate models non-side-effecting preparation that can
+    // yield to a cancel/reset; the side-effect gate models a long-running
+    // action already in flight. Both default to null (no barrier).
+    preSideEffectGate: null, gateReached: false, sideEffectGate: null,
+  };
+  const events = [];
+  const session = new AgentSession(Object.assign({
+    modelClient: async () => {
+      state.modelCalls++;
+      return state.modelCalls === 1 ? TOOL_CALL : FINAL;
+    },
+    toolPort: asToolPort(async (tool, input, workspace, opts) => {
+      const signal = opts && opts.signal;
+      state.toolEntries++;
+      const decision = await c.request({
+        kind: 'permission',
+        action: { type: 'tool', summary: 'Run ' + tool + ': ' + input },
+        policyKey: 'perm:tool:' + tool,
+        conversationId: 'conv-1',
+        taskGeneration: session ? session.generation : null,
+      }, { signal });
+      state.decisions.push(decision);
+      if (decision.outcome !== 'allow') {
+        return { output: 'not executed: ' + decision.outcome, success: false, backend: 'harness' };
+      }
+      // Consumer execution contract (docs/APPROVALS.md): allow authorizes
+      // the ACTION, but task liveness must be revalidated at the last
+      // synchronous checkpoint before the protected side effect. The gate
+      // below is the only await allowed between decision and recheck, and
+      // there is NO await after the recheck.
+      if (state.preSideEffectGate) {
+        state.gateReached = true;
+        await state.preSideEffectGate;
+      }
+      try {
+        throwIfAborted(signal);
+      } catch (e) {
+        // Aborted after allow but before the effect started: the action is
+        // never executed and is honestly reported as not executed.
+        return { output: 'not executed: cancelled after allow (task no longer live)', success: false, backend: 'harness' };
+      }
+      // PROTECTED SIDE EFFECT starts here. Past this point cancellation
+      // stops the task but never rolls back (cancellation is not rollback).
+      state.sideEffects++;
+      if (state.sideEffectGate) await state.sideEffectGate;
+      return { output: 'tool ran', success: true, backend: 'harness' };
+    }),
+    buildSystemPrompt: buildSystemPrompt,
+    emit: (e) => events.push(e),
+  }, overrides || {}));
+  return { session, events, c, approvalEvents, state };
+}
+
+const evTypes = (events) => events.map((e) => e.type).join(',');
+const count = (events, type) => events.filter((e) => e.type === type).length;
+const WS = { name: 'W' };
+
+async function run() {
+  // ---------- S1. suspension + same-task resume (the core invariant) ----------
+  {
+    const { session, events, c, state } = approvalSession();
+    const generationBefore = session.generation;
+    const runPromise = session.run('list files', { workspace: WS });
+    check('S1 approval appears while task runs', await waitFor(() => c.hasPending()));
+    check('S1 task paused: no second model call while pending', state.modelCalls === 1);
+    check('S1 task paused: no task_end while pending', count(events, 'task_end') === 0);
+    check('S1 task_start emitted exactly once', count(events, 'task_start') === 1);
+    check('S1 session still holds the task (running)', !!session.task);
+
+    const resolveOk = c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+    const finished = await runPromise; // resolves — SAME task, no new submit
+    check('S1 allow once resolved the request', resolveOk === true);
+    check('S1 run() promise of the SAME task resolved (no rejection)', finished === undefined);
+    check('S1 SAME tool continuation executed the tool', state.toolEntries === 1 && state.decisions[0].outcome === 'allow');
+    check('S1 session continued to the next model request', state.modelCalls === 2);
+
+    check('S1 event chain: one complete task, no restart',
+      evTypes(events) === 'task_start,tool_call,tool_result,assistant_text,task_end', evTypes(events));
+    check('S1 exactly one task_start and one task_end (completed)',
+      count(events, 'task_start') === 1 && count(events, 'task_end') === 1
+      && events[events.length - 1].reason === 'completed');
+    check('S1 generation unchanged by the approval round-trip',
+      session.generation === generationBefore);
+    check('S1 no task left dangling', session.task === null);
+    // Provider history: user task + assistant call + user tool feedback +
+    // final assistant. The approval itself added NO user/assistant turn.
+    const roles = session.history.map((m) => m.role).join(',');
+    check('S1 provider history untouched by approval',
+      roles === 'user,assistant,user,assistant'
+      && session.history.every((m) => !String(m.content || '').includes('approval')),
+      roles);
+    check('S1 controller holds no grant after allow-once', !c.hasSessionGrant('perm:tool:bash'));
+  }
+
+  // ---------- S2. deny ≠ task cancel ----------
+  {
+    const { session, events, c, state } = approvalSession();
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
+    await runPromise;
+
+    check('S2 denial reached the tool as deny', state.decisions[0].outcome === 'deny');
+    check('S2 task CONTINUED after deny: next model call happened', state.modelCalls === 2);
+    check('S2 task completed normally', count(events, 'task_end') === 1
+      && events[events.length - 1].reason === 'completed');
+    check('S2 failed tool_result fed back to the model (success: false)',
+      session.history.some((m) => m.role === 'user'
+        && typeof m.content === 'string' && m.content.includes('success: false')
+        && m.content.includes('not executed: deny')));
+    check('S2 no cancellation warning emitted',
+      !events.some((e) => e.type === 'warning' && e.code === 'task_cancelled_committed'));
+    check('S2 generation unchanged (deny is not a session boundary)', session.generation === 0);
+  }
+
+  // ---------- S3. cancel task while approval pending ----------
+  {
+    const { session, events, c, state } = approvalSession();
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    const pendingId = c.pending.id;
+    session.cancel(); // the ONLY cancel path — no approval-side shortcut
+    await runPromise;
+    const decision = state.decisions[0];
+
+    check('S3 pending approval closed immediately as cancelled',
+      decision.outcome === 'cancelled' && decision.reason === 'aborted');
+    check('S3 no stale approval left pending', !c.hasPending());
+    check('S3 tool did NOT execute the action', state.decisions[0].outcome === 'cancelled');
+    check('S3 no further model call after cancel', state.modelCalls === 1);
+    check('S3 task ended cancelled exactly once',
+      count(events, 'task_end') === 1 && events[events.length - 1].reason === 'cancelled');
+    check('S3 no new task_start was emitted', count(events, 'task_start') === 1);
+    check('S3 run promise settled (no dangling await)', true);
+    check('S3 stale resolve after cancel is a no-op',
+      c.resolve(pendingId, { outcome: 'allow', scope: 'session' }) === false && !c.hasPending());
+  }
+
+  // ---------- S4. session switch (reset) while approval pending ----------
+  {
+    const { session, events, c, state } = approvalSession();
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    const staleId = c.pending.id;
+    session.reset(); // newTask()/workspace-switch boundary
+    await runPromise;
+
+    check('S4 old approval cancelled by the session boundary',
+      state.decisions[0].outcome === 'cancelled' && !c.hasPending());
+    check('S4 old task ended session_changed exactly once',
+      count(events, 'task_end') === 1 && events[events.length - 1].reason === 'session_changed');
+    check('S4 no further model call for the old task', state.modelCalls === 1);
+    check('S4 generation bumped, history cleared', session.generation === 1 && session.history.length === 0);
+
+    // A NEW task on the new generation runs cleanly; the stale approval id
+    // from the old task cannot touch it.
+    const staleResolve = c.resolve(staleId, { outcome: 'allow', scope: 'session' });
+    state.modelCalls = 0; // second task must re-enter the tool-call branch
+    const second = session.run('again', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    check('S4 stale approval button cannot affect the NEW task',
+      staleResolve === false && c.pending.id !== staleId);
+    c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+    await second;
+    check('S4 new task completed on the new generation',
+      state.modelCalls === 2 && count(events, 'task_end') === 2
+      && events[events.length - 1].reason === 'completed');
+    check('S4 grant from stale id was never minted', !c.hasSessionGrant('perm:tool:bash'));
+  }
+
+  // ---------- S5. session grant auto-allows inside the agent loop ----------
+  {
+    const { session, events, c, state } = approvalSession();
+    // First task: allow for session.
+    const first = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    c.resolve(c.pending.id, { outcome: 'allow', scope: 'session' });
+    await first;
+    // Second task, same session: tool re-asks the same policyKey — the
+    // controller auto-allows with NO pending state and NO second model
+    // stall, and the task runs straight through.
+    state.modelCalls = 0;
+    await session.run('list files again', { workspace: WS });
+    check('S5 granted policy auto-allows inside a later task',
+      state.decisions.length === 2 && state.decisions[1].viaGrant === true);
+    check('S5 no approval round-trip stalled the granted task',
+      !c.hasPending() && count(events, 'task_end') === 2
+      && events[events.length - 1].reason === 'completed');
+  }
+
+  // ---------- S6. F-A02/A03: allow → abort BEFORE the side effect ----------
+  // allow → decision delivered → consumer yields in non-side-effecting
+  // preparation → session.cancel() → final liveness recheck. The action
+  // must never start; the task ends cancelled exactly once.
+  {
+    const { session, events, c, state } = approvalSession();
+    let openGate;
+    state.preSideEffectGate = new Promise((r) => { openGate = r; });
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' }); // decision delivered
+    await waitFor(() => state.gateReached); // consumer is between decision and effect
+    session.cancel(); // task aborts inside that window
+    openGate();
+    await runPromise;
+
+    check('S6 allow decision was delivered to the consumer', state.decisions[0].outcome === 'allow');
+    check('S6 approval allow is revalidated before side effect: action never started',
+      state.sideEffects === 0, 'sideEffects=' + state.sideEffects);
+    check('S6 unstarted action honestly reported as not executed',
+      events.some((e) => e.type === 'tool_result' && e.success === false
+        && /not executed/.test(e.output)));
+    check('S6 task ended cancelled exactly once (no duplicate task_end)',
+      count(events, 'task_end') === 1 && events[events.length - 1].reason === 'cancelled');
+    check('S6 no duplicate task_start', count(events, 'task_start') === 1);
+    check('S6 no dangling task', session.task === null);
+  }
+
+  // ---------- S7. allow → session reset BEFORE the side effect ----------
+  // A reset/newTask boundary between decision delivery and the effect must
+  // also prevent the OLD task from starting its action, and the old task
+  // must leave nothing in the new execution context.
+  {
+    const { session, events, c, state } = approvalSession();
+    let openGate;
+    state.preSideEffectGate = new Promise((r) => { openGate = r; });
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+    await waitFor(() => state.gateReached);
+    session.reset(); // newTask()/workspace-switch equivalent
+    openGate();
+    await runPromise;
+
+    check('S7 old task never started the allowed action after reset',
+      state.sideEffects === 0, 'sideEffects=' + state.sideEffects);
+    check('S7 old task ended session_changed exactly once',
+      count(events, 'task_end') === 1 && events[events.length - 1].reason === 'session_changed');
+    check('S7 generation bumped by the boundary', session.generation === 1);
+    check('S7 old task left nothing in the new execution context',
+      session.history.length === 0);
+    check('S7 no stale approval left pending', !c.hasPending());
+  }
+
+  // ---------- S8. action already started → cancel: no rollback pretense ----------
+  // Final liveness check passed, the side effect STARTED (counter = 1), the
+  // consumer is blocked inside the action, then the task is cancelled. The
+  // action stays executed and its result is reported as executed — never
+  // rewritten as "not executed" (cancellation is not rollback).
+  {
+    const { session, events, c, state } = approvalSession();
+    let releaseSideEffect;
+    state.sideEffectGate = new Promise((r) => { releaseSideEffect = r; });
+    const runPromise = session.run('list files', { workspace: WS });
+    await waitFor(() => c.hasPending());
+    c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+    await waitFor(() => state.sideEffects === 1); // action committed
+    session.cancel(); // cancel AFTER the action started
+    releaseSideEffect();
+    await runPromise;
+
+    check('S8 allow then live task: action ran exactly once',
+      state.sideEffects === 1, 'sideEffects=' + state.sideEffects);
+    const toolResult = events.filter((e) => e.type === 'tool_result').pop();
+    check('S8 completed action is reported as executed (no fake "not executed")',
+      toolResult && toolResult.success === true && toolResult.output === 'tool ran',
+      toolResult && toolResult.output);
+    check('S8 task ended cancelled exactly once',
+      count(events, 'task_end') === 1 && events[events.length - 1].reason === 'cancelled');
+    check('S8 no rollback warning: cancellation is not rollback',
+      events.some((e) => e.type === 'warning' && e.code === 'task_cancelled_committed'));
+    check('S8 no dangling task', session.task === null);
+  }
+
+  console.log('---');
+  console.log(failed ? failed + ' check(s) FAILED' : 'all ' + passed + ' agent×approval integration checks passed');
+  process.exit(failed ? 1 : 0);
+}
+
+run().catch((e) => { console.error(e && e.stack || e); process.exit(1); });

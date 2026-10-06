@@ -28,6 +28,44 @@ Product store/persistence/tools routing, IDB/OPFS. Tools arrive through an injec
 through injected storage ports, image bytes through an image-input port, telemetry
 through an injected sink.
 
+## Public surface (import from `'locus-harness'`)
+
+The package exposes exactly one entry (`.`). Grouped exports:
+
+- Agent loop: `createAgentSession` / `AgentSession`, `buildSystemPrompt`,
+  `historyBudgetBytes()`, `maxToolIterations()`, `HISTORY_BUDGET_BYTES`,
+  `MAX_TOOL_ITERATIONS`.
+- Task lifecycle: `createTaskRunner`, `isPersistenceFailure`, `TASK_OUTCOME_REASONS`.
+- Provider sessions + replay validation: `createProviderSessions`,
+  `replayValidationError`, `validateReplayPrefix`, `validateNormalizedPrefix`.
+- Model layer: `createModelClient`, `MODEL_TIMEOUT_MS`, `MODEL_MAX_RESPONSE_BYTES`,
+  `getProviderAdapter`, `OpenAIAdapter`, `AnthropicAdapter`,
+  `createProviderIdentity`, `createCredentialIdentity`, `projectNormalizedHistory`,
+  `rawReplayIdentityCompatible`.
+- Approval semantics: `createApprovalController` / `ApprovalController`, `APPROVAL_KINDS`.
+- Image capability gate: `createModelCapabilityRegistry` / `ModelCapabilityRegistry`,
+  `createImageInputGate`, `runImageInputProbe`, `classifyImageProviderError`,
+  `imageInputUnavailableNotice`.
+- Capability composition core: `createCapabilityManager` / `CapabilityManager`,
+  `SkillSourceStore`, `pythonExtensionKeyOf`, `validatePluginPayload`,
+  `registerPluginRuntimeProvider`, `EXTENSION_ID_PATTERN`,
+  `EXTENSION_PY_MODULE_PATTERN`, `CAPABILITY_CATALOG`, `PLUGIN_CATALOG`,
+  `SKILL_CATALOG`, `MCP_CATALOG`.
+- Descriptor + skill-instance contract (added by review round 1 — real Product
+  consumers at the source baseline; the ORIGINAL definitions, no copies):
+  `validateCapabilityDescriptor`, `validatePluginDescriptor`,
+  `validateSkillDescriptor`, `validateMcpDescriptor`, `skillInstancePath`,
+  `SKILL_INSTANCE_ROOT`, `SKILL_INSTANCE_MARKER`, `SKILL_INSTANCE_MAX_BYTES`,
+  `sha256Hex`.
+- Declaration + compat: `harnessCapabilities()`, `ensureHarnessCore()` (a
+  no-assembly shim resolving to `undefined` — factories need no init call).
+
+Deliberately NOT exported: `SKILL_DIFF_MAX_CHARS` — an approval-card display
+bound with no Harness consumer; it belongs to the Product (moves into the
+Product at M3c). Package-internal module exports (test-only consumers) stay
+off the entry; see `docs/EXTRACTION-PLAN.md` §3 for the full caller-audit
+table and the ownership decisions.
+
 License: Apache-2.0 (see [LICENSE](LICENSE)). Provenance: source commit, per-file blob
 SHAs and extraction mapping are recorded in `docs/PROVENANCE.md` on the implementation
 branch.
