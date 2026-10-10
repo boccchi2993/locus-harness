@@ -3,12 +3,12 @@
 Locus Harness — model-driven agent execution and orchestration, extracted from the
 [Locus product repository](https://github.com/boccchi2993/Locus-browser-agent-runtime).
 
-**Status: extraction candidate (M3b). This `main` branch is intentionally minimal —
-the implementation lives on `refactor/extract-harness` and is not merged yet. Until
-the Product switches its imports (M3c), the authoritative Harness implementation
-remains in the product repository at
-`2aec76e78431382873be1db8a6db6310cc89c782` (branch `refactor/repository-split-m2c`,
-PR #7).**
+**Status: repository split complete; implementation merged into `main`.**
+This repository is the authoritative Harness implementation. It operates without
+[locus-runtime](https://github.com/boccchi2993/locus-runtime), using injected tools and storage ports.
+[locus-product](https://github.com/boccchi2993/locus-product) composes the two independent packages.
+See the [M4b mainline verification](https://github.com/boccchi2993/locus-product/blob/main/docs/M4B-MAINLINE-VERIFICATION.md)
+and [maintenance TODO](TODO.md) for remaining test-infrastructure work.
 
 Owns (independent of the Runtime and the Product):
 
@@ -61,11 +61,26 @@ The package exposes exactly one entry (`.`). Grouped exports:
   no-assembly shim resolving to `undefined` — factories need no init call).
 
 Deliberately NOT exported: `SKILL_DIFF_MAX_CHARS` — an approval-card display
-bound with no Harness consumer; it belongs to the Product (moves into the
-Product at M3c). Package-internal module exports (test-only consumers) stay
+bound with no Harness consumer; it belongs to the Product and was moved there during M3c. Package-internal module exports (test-only consumers) stay
 off the entry; see `docs/EXTRACTION-PLAN.md` §3 for the full caller-audit
 table and the ownership decisions.
 
 License: Apache-2.0 (see [LICENSE](LICENSE)). Provenance: source commit, per-file blob
-SHAs and extraction mapping are recorded in `docs/PROVENANCE.md` on the implementation
-branch.
+SHAs and extraction mapping are recorded in [docs/PROVENANCE.md](docs/PROVENANCE.md).
+
+## Development and consumption
+
+```bash
+npm ci
+npm run build
+npm test
+npm run test:e2e
+npm pack
+```
+
+The split-closeout baseline has 18 unit suites and a built standalone Harness
+browser host. Browser tests require Chrome. The independent tarball consumer uses
+its own installation and build; see [coverage](docs/TEST-COVERAGE-MAP.md) and
+[verification](docs/M3B-VERIFICATION.md). Model traffic in these gates uses fakes.
+The package is private and is not published to npm; consume a packed tarball or
+an exact Git commit, importing only from `locus-harness`.
