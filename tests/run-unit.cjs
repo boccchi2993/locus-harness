@@ -35,6 +35,12 @@ const SUITES = [
   'harness-standalone.test.mjs',
   'harness-boundary.test.cjs',
   'import-purity.test.mjs',
+  // HN-TEST-001: the real tests/e2e.cjs orchestrator's success
+  // classification (exit 0 / nonzero / signal / spawn error), driven
+  // through the TEST-ONLY gate seams. Four real orchestrator runs,
+  // each with its own vite build + preview — the slow suite in this
+  // list by design.
+  'e2e-orchestrator.test.cjs',
 ];
 
 let failed = 0;
