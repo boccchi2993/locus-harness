@@ -8,7 +8,7 @@ on:
 jobs:
   unit:
     name: unit tests (Node)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,7 +22,7 @@ jobs:
 
   build:
     name: build + package checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,7 +47,7 @@ jobs:
 
   browser:
     name: harness host browser gate (headless Chrome)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [unit, build]
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
 
   consumer:
     name: out-of-checkout tarball consumer (headless Chrome)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [unit, build]
     steps:
       - uses: actions/checkout@v4
