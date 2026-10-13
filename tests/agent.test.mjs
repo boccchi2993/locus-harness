@@ -803,6 +803,100 @@ async function run() {
       && session.history[2].toolCallId.length > 0, JSON.stringify(session.history[2].toolCallId));
   }
 
+  // ---------- TR. truncateFor keeps head AND tail (surrogate-safe) ----------
+  {
+    // TR1: at or under the limit, the string is returned untouched
+    check('TR1 short output is returned unchanged', truncateFor('hello world', 100) === 'hello world'
+      && truncateFor('', 10) === '' && truncateFor(null, 10) === '', '');
+
+    // TR2: 20000 chars at max 6000 → 2000-char head + 4000-char tail,
+    // marker reports the exact omitted count (20000 - 2000 - 4000 = 14000)
+    const big = Array.from({ length: 20000 }, (_, i) => String.fromCharCode(0x100 + (i % 5000))).join('');
+    const cut = truncateFor(big, 6000);
+    const marker = cut.match(/\n\.\.\. \[truncated (\d+) chars in the middle\] \.\.\.\n/);
+    check('TR2 head+tail preserved with exact omitted count', marker !== null && Number(marker[1]) === 14000
+      && cut.startsWith(big.slice(0, 2000)) && cut.endsWith(big.slice(20000 - 4000))
+      && cut.length === 2000 + 4000 + marker[0].length,
+      marker && marker[1]);
+
+    // TR3: a surrogate pair straddling EITHER cut boundary never splits
+    // (head boundary pair after position 1999; tail boundary pair whose low
+    // surrogate would have started the tail slice). Both corrections shrink
+    // the kept halves by 1 → omitted = 14000 - 1999 - 3999 = 8002.
+    const pairStr = 'a'.repeat(1999) + '\u{1F600}' + 'b'.repeat(7998) + '\u{1F600}' + 'c'.repeat(3999);
+    const pairCut = truncateFor(pairStr, 6000);
+    const orphan = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const pairMarker = '\n... [truncated 8002 chars in the middle] ...\n';
+    check('TR3 no orphaned surrogate at either boundary', pairCut === 'a'.repeat(1999) + pairMarker + 'c'.repeat(3999)
+      && !orphan.test(pairCut), JSON.stringify(pairCut.slice(1990, 2010)));
+
+    // TR4: the model-boundary feedback path actually carries head AND tail
+    // of a long tool output
+    const longOutput = 'HEAD>>' + 'x'.repeat(19990) + '<<TAIL';
+    let feedback = null;
+    const { session } = newSession({
+      modelClient: (() => { let n = 0; return async (body) => {
+        if (++n === 1) return TOOL_CALL;
+        feedback = body.messages[body.messages.length - 1].content;
+        return FINAL;
+      }; })(),
+      toolPort: asToolPort(async () => ({ output: longOutput, success: true })),
+    });
+    await session.run('task', { workspace: WS_A });
+    check('TR4 model-boundary tool result keeps head and tail of long output', feedback !== null
+      && feedback.includes('HEAD>>') && feedback.includes('<<TAIL')
+      && feedback.includes('chars in the middle'), feedback && feedback.slice(0, 80));
+  }
+
+  // ---------- MT. max_tokens is user configuration (DECISIONS.md D5) ----------
+  {
+    // MT1: absent maxTokens → the 8192 default reaches the wire
+    const seen1 = [];
+    const s1 = newSession({ modelClient: async (body) => { seen1.push(body); return FINAL; } });
+    await s1.session.run('task', { workspace: WS_A });
+    check('MT1 default max_tokens is 8192', seen1.length === 1 && seen1[0].max_tokens === 8192,
+      seen1[0] && seen1[0].max_tokens);
+
+    // MT2: explicit maxTokens is passed through verbatim
+    const seen2 = [];
+    const s2 = newSession({
+      modelClient: async (body) => { seen2.push(body); return FINAL; },
+      maxTokens: 4096,
+    });
+    await s2.session.run('task', { workspace: WS_A });
+    check('MT2 configured max_tokens reaches the request', seen2.length === 1 && seen2[0].max_tokens === 4096,
+      seen2[0] && seen2[0].max_tokens);
+
+    // MT3: non-positive / non-integer / non-numeric values are construction errors
+    let threw = [];
+    for (const bad of [0, -1, 1.5, '8192']) {
+      try {
+        new AgentSession({ modelClient: async () => FINAL, toolPort: asToolPort(async () => ({ output: 'ok', success: true })), maxTokens: bad });
+      } catch (e) { threw.push(String(bad) + ':' + e.message); }
+    }
+    check('MT3 invalid maxTokens rejected at construction', threw.length === 4
+      && threw.every((t) => t.includes('maxTokens must be a positive integer')), threw.join(' | '));
+
+    // MT4: an HTTP 400 pointing at the output budget appends the dial-down
+    // hint; the failed request is NOT resent (HTTP errors never are)
+    let calls4 = 0;
+    const { session: s4, events } = newSession({
+      modelClient: async () => {
+        calls4++;
+        const e = new Error('max_tokens is too large');
+        e.name = 'HttpError'; e.status = 400;
+        throw e;
+      },
+    });
+    await s4.run('task', { workspace: WS_A });
+    const err4 = events.find((e) => e.type === 'error' && e.code === 'model_call_failed');
+    check('MT4 oversized-budget 400 hints at the setting, no resend', !!err4
+      && err4.message.includes('max_tokens=8192')
+      && err4.message.includes('请在设置中调低')
+      && err4.message.includes('max_tokens is too large')
+      && calls4 === 1, JSON.stringify(err4 && err4.message) + ' calls=' + calls4);
+  }
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

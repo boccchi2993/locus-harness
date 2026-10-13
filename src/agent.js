@@ -42,6 +42,9 @@ const HISTORY_BUDGET_BYTES = 768 * 1024;
 // Slack for the request envelope itself (model, max_tokens, JSON keys,
 // base64-free system framing, etc.).
 const REQUEST_OVERHEAD_BYTES = 4096;
+// Default output budget per model request. Per DECISIONS.md D5 this is
+// user configuration (deps.maxTokens), never inferred from the model name.
+const DEFAULT_MAX_TOKENS = 8192;
 
 function agentPersistenceFailure(cause, method) {
   if (cause && cause.persistenceFailure) return cause;
@@ -69,10 +72,23 @@ function stripInternalFields(messages) {
   });
 }
 
+// Keep the head AND the tail: tracebacks, test failures and compiler
+// errors usually sit at the END of tool output. The marker reports the
+// exact number of omitted UTF-16 code units. Boundaries never split a
+// surrogate pair.
 function truncateFor(s, max) {
   s = String(s || '');
   if (s.length <= max) return s;
-  return s.slice(0, max) + '\n... [truncated ' + (s.length - max) + ' chars]';
+  let head = Math.floor(max / 3);
+  let tail = max - head;
+  const hc = s.charCodeAt(head - 1);
+  if (hc >= 0xD800 && hc <= 0xDBFF) head -= 1;
+  const tc = s.charCodeAt(s.length - tail);
+  if (tc >= 0xDC00 && tc <= 0xDFFF) tail -= 1;
+  const omitted = s.length - head - tail;
+  return s.slice(0, head)
+    + '\n... [truncated ' + omitted + ' chars in the middle] ...\n'
+    + s.slice(s.length - tail);
 }
 
 // Parse a model reply: either a tool call or a final answer.
@@ -506,6 +522,10 @@ class AgentSession {
     // gate + attachment resolver. Optional — registry-less harnesses and
     // text-only deployments leave it null and nothing changes.
     this.imageInput = d.imageInput && typeof d.imageInput === 'object' ? d.imageInput : null;
+    if (d.maxTokens != null && !(Number.isInteger(d.maxTokens) && d.maxTokens > 0)) {
+      throw new Error('AgentSession: maxTokens must be a positive integer');
+    }
+    this.maxTokens = d.maxTokens != null ? d.maxTokens : DEFAULT_MAX_TOKENS;
   }
 
   setPersistenceContext(context) { this.persistence = context || null; }
@@ -912,7 +932,7 @@ class AgentSession {
         let envelope;
         try {
           const request = {
-            max_tokens: 2000,
+            max_tokens: this.maxTokens,
             system: this.buildSystemPrompt(promptInput),
             messages: requestMessages,
           };
@@ -933,7 +953,16 @@ class AgentSession {
             end(sessionChanged() ? 'session_changed' : 'cancelled');
             return;
           }
-          emit({ type: 'error', code: 'model_call_failed', message: '模型调用失败: ' + (e && e.message ? e.message : String(e)) });
+          // HTTP errors are never resent (unchanged rule). A 400/422 that
+          // clearly points at the output budget gets a pointer to the user
+          // configuration instead of a retry.
+          let callFailedMessage = '模型调用失败: ' + (e && e.message ? e.message : String(e));
+          if (e && e.name === 'HttpError' && (e.status === 400 || e.status === 422)
+            && /max_tokens|max_completion_tokens|maximum.*tokens/i.test(
+              (e && e.message ? e.message : '') + ' ' + JSON.stringify((e && e.providerError) || {}))) {
+            callFailedMessage += '（当前 max_tokens=' + this.maxTokens + '，可能超出该模型的上限，请在设置中调低）';
+          }
+          emit({ type: 'error', code: 'model_call_failed', message: callFailedMessage });
           end('error');
           return;
         }
