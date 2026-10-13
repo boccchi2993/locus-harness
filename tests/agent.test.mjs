@@ -895,6 +895,40 @@ async function run() {
       && err4.message.includes('请在设置中调低')
       && err4.message.includes('max_tokens is too large')
       && calls4 === 1, JSON.stringify(err4 && err4.message) + ' calls=' + calls4);
+
+    // MT5: setMaxTokens (product settings change) applies from the NEXT task on
+    const seen5 = [];
+    const s5 = newSession({ modelClient: async (body) => { seen5.push(body.max_tokens); return FINAL; } });
+    await s5.session.run('task', { workspace: WS_A });
+    s5.session.setMaxTokens(1024);
+    await s5.session.run('task 2', { workspace: WS_A });
+    check('MT5 setMaxTokens takes effect on the next task', seen5.length === 2
+      && seen5[0] === 8192 && seen5[1] === 1024, JSON.stringify(seen5));
+
+    // MT6: a mid-task setMaxTokens must not touch the running task — run()
+    // snapshot the value once at task start
+    const seen6 = [];
+    const s6 = newSession({
+      modelClient: (() => { let n = 0; return async (body) => {
+        seen6.push(body.max_tokens);
+        if (++n === 1) { s6.session.setMaxTokens(1024); return TOOL_CALL; }
+        return FINAL;
+      }; })(),
+    });
+    await s6.session.run('task', { workspace: WS_A });
+    check('MT6 mid-task setMaxTokens leaves both requests at the task-start value', seen6.length === 2
+      && seen6[0] === 8192 && seen6[1] === 8192
+      && s6.session.maxTokens === 1024, JSON.stringify(seen6) + ' session.maxTokens=' + s6.session.maxTokens);
+
+    // MT7: setMaxTokens rejects invalid values and keeps the previous one
+    const s7 = newSession({ maxTokens: 4096 });
+    const thrown7 = [];
+    for (const bad of [0, -1, 1.5, '1024']) {
+      try { s7.session.setMaxTokens(bad); } catch (e) { thrown7.push(String(bad) + ':' + e.message); }
+    }
+    check('MT7 invalid setMaxTokens throws, value unchanged', thrown7.length === 4
+      && thrown7.every((t) => t.includes('maxTokens must be a positive integer'))
+      && s7.session.maxTokens === 4096, thrown7.join(' | '));
   }
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');

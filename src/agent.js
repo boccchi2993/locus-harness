@@ -530,6 +530,15 @@ class AgentSession {
 
   setPersistenceContext(context) { this.persistence = context || null; }
 
+  // Product settings may change the output budget between tasks. A task
+  // that is already running keeps the value it started with (see run()).
+  setMaxTokens(n) {
+    if (!(Number.isInteger(n) && n > 0)) {
+      throw new Error('AgentSession: maxTokens must be a positive integer');
+    }
+    this.maxTokens = n;
+  }
+
   async _persist(method, payload, options) {
     const p = this.persistence;
     if (!p || typeof p[method] !== 'function') return null;
@@ -812,6 +821,7 @@ class AgentSession {
     // Per-run image-gate cache (docs/IMAGE-INPUT.md): one identity is
     // asked/probed at most once per task run — no same-run loops.
     const imageAskCache = new Map();
+    const maxTokens = this.maxTokens; // snapshot: fixed for this whole task
     try {
       // ---- the task's ONE tool/description snapshot (M2b) ----
       // Read once, here — every later consumer (prompt, request.tools,
@@ -932,7 +942,7 @@ class AgentSession {
         let envelope;
         try {
           const request = {
-            max_tokens: this.maxTokens,
+            max_tokens: maxTokens,
             system: this.buildSystemPrompt(promptInput),
             messages: requestMessages,
           };
@@ -960,7 +970,7 @@ class AgentSession {
           if (e && e.name === 'HttpError' && (e.status === 400 || e.status === 422)
             && /max_tokens|max_completion_tokens|maximum.*tokens/i.test(
               (e && e.message ? e.message : '') + ' ' + JSON.stringify((e && e.providerError) || {}))) {
-            callFailedMessage += '（当前 max_tokens=' + this.maxTokens + '，可能超出该模型的上限，请在设置中调低）';
+            callFailedMessage += '（当前 max_tokens=' + maxTokens + '，可能超出该模型的上限，请在设置中调低）';
           }
           emit({ type: 'error', code: 'model_call_failed', message: callFailedMessage });
           end('error');
