@@ -141,7 +141,12 @@ export function createProviderSessions(deps) {
             name: 'ReplayValidationError', code: 'uncheckpointed_suffix', replayInvalid: true,
           });
         }
-        session.history = frames.map((f) => f.raw).filter(Boolean);
+        // Task boundaries are internal markers and are never persisted: a
+        // restored user frame starts a task again. Copy, never mutate the
+        // stored raw object (docs/CONTEXT-MANAGEMENT.md §3.3).
+        session.history = frames
+          .filter((f) => f && f.raw)
+          .map((f) => (f.kind === 'user' ? Object.assign({}, f.raw, { _taskStart: true }) : f.raw));
       } catch (e) {
         previous.rawReplayInvalid = true;
         previous.persistenceState = 'invalid';

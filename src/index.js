@@ -221,6 +221,7 @@ export function harnessCapabilities() {
   declaration.capabilities.providerReplay = true;       // real validators
   declaration.capabilities.imageInputGate = true;       // the gate trio ships here
   declaration.capabilities.capabilityComposition = true; // the composition core ships here
+  declaration.capabilities.requestBudget = true;        // setRequestBudget / minimumRequestBytes / low-water trim + elision
 
   return deepFreezeDeclaration(declaration);
 }
