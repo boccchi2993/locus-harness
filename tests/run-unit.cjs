@@ -15,6 +15,7 @@ const SUITES = [
   'agent.test.mjs',
   'agent-approval.test.mjs',
   'agent-image.test.mjs',
+  'request-budget.test.mjs',
   // approval
   'approval.test.mjs',
   // image capability

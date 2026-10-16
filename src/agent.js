@@ -42,6 +42,15 @@ const HISTORY_BUDGET_BYTES = 768 * 1024;
 // Slack for the request envelope itself (model, max_tokens, JSON keys,
 // base64-free system framing, etc.).
 const REQUEST_OVERHEAD_BYTES = 4096;
+// After a trim, history is cut down to this fraction of the budget so the
+// following turns append to a stable prefix instead of trimming again on
+// every turn (docs/CONTEXT-MANAGEMENT.md §3.3, DECISIONS.md D9).
+const BUDGET_LOW_WATER_RATIO = 0.6;
+// Within-task elision never touches the most recent tool results.
+const ELIDE_KEEP_RECENT_RESULTS = 4;
+// Slack per tool for the provider wire wrapper around a definition.
+const TOOL_WIRE_OVERHEAD_BYTES = 64;
+const ELIDED_NOTICE = '[earlier tool output elided to fit the request budget';
 // Default output budget per model request. Per DECISIONS.md D5 this is
 // user configuration (deps.maxTokens), never inferred from the model name.
 const DEFAULT_MAX_TOKENS = 8192;
@@ -70,6 +79,24 @@ function stripInternalFields(messages) {
     for (const k in m) if (k.charCodeAt(0) !== 95 /* '_' */) out[k] = m[k];
     return out;
   });
+}
+
+// A tool result entry of the CURRENT task that may be elided: a native
+// tool_result, or a text-fallback feedback turn (user role, starts with
+// <tool_result>). Task starts and already-elided entries never qualify.
+function isElidableToolResult(m) {
+  if (!m || m._elided || m._taskStart) return false;
+  if (m.role === 'tool_result') return true;
+  return m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('<tool_result>');
+}
+
+// Copy-on-write replacement: the original entry object is never mutated
+// (persisted frames and test fakes may hold the same reference).
+function elidedToolResult(entry) {
+  const path = typeof entry._outputPath === 'string' && entry._outputPath ? entry._outputPath : null;
+  const stub = ELIDED_NOTICE + (path ? '; full output: ' + path : '') + ']';
+  const content = entry.role === 'tool_result' ? stub : '<tool_result>\n' + stub + '\n</tool_result>';
+  return Object.assign({}, entry, { content: content, _elided: true });
 }
 
 // Keep the head AND the tail: tracebacks, test failures and compiler
@@ -526,6 +553,10 @@ class AgentSession {
       throw new Error('AgentSession: maxTokens must be a positive integer');
     }
     this.maxTokens = d.maxTokens != null ? d.maxTokens : DEFAULT_MAX_TOKENS;
+    if (d.requestBudgetBytes != null && !(Number.isInteger(d.requestBudgetBytes) && d.requestBudgetBytes > 0)) {
+      throw new Error('AgentSession: requestBudgetBytes must be a positive integer');
+    }
+    this.requestBudget = d.requestBudgetBytes != null ? d.requestBudgetBytes : HISTORY_BUDGET_BYTES;
   }
 
   setPersistenceContext(context) { this.persistence = context || null; }
@@ -538,6 +569,17 @@ class AgentSession {
     }
     this.maxTokens = n;
   }
+
+  // Transport byte budget for one request. A running task keeps the value
+  // it started with (see run()).
+  setRequestBudget(n) {
+    if (!(Number.isInteger(n) && n > 0)) {
+      throw new Error('AgentSession: requestBudgetBytes must be a positive integer');
+    }
+    this.requestBudget = n;
+  }
+
+  requestBudgetBytes() { return this.requestBudget; }
 
   async _persist(method, payload, options) {
     const p = this.persistence;
@@ -596,18 +638,36 @@ class AgentSession {
     };
   }
 
-  // Prompt bytes for one prompt input (see historyRequestBytes).
-  _requestBytesFor(promptInput) {
+  // System prompt + tool definitions + envelope slack: everything except
+  // the history messages. Tool schemas travel in request.tools and count.
+  _baseRequestBytes(promptInput) {
     const enc = new TextEncoder();
     let n = REQUEST_OVERHEAD_BYTES + enc.encode(this.buildSystemPrompt(promptInput)).byteLength;
-    for (const m of stripInternalFields(this.history)) {
-      n += enc.encode(JSON.stringify(m)).byteLength + 16;
-      if (m.role === 'user' && Array.isArray(m.content)) {
-        for (const part of m.content) {
-          if (part && part.type === 'image') n += estimateImageWireBytes(part.size);
-        }
+    const tools = promptInput && Array.isArray(promptInput.tools) ? promptInput.tools : null;
+    if (tools && tools.length) {
+      n += enc.encode(JSON.stringify(tools)).byteLength + TOOL_WIRE_OVERHEAD_BYTES * tools.length;
+    }
+    return n;
+  }
+
+  // Wire bytes of ONE history entry (internal fields stripped; semantic
+  // image parts at their resolved size).
+  _entryBytes(m) {
+    const enc = new TextEncoder();
+    const wire = stripInternalFields([m])[0];
+    let n = enc.encode(JSON.stringify(wire)).byteLength + 16;
+    if (wire.role === 'user' && Array.isArray(wire.content)) {
+      for (const part of wire.content) {
+        if (part && part.type === 'image') n += estimateImageWireBytes(part.size);
       }
     }
+    return n;
+  }
+
+  // Prompt bytes for one prompt input (see historyRequestBytes).
+  _requestBytesFor(promptInput) {
+    let n = this._baseRequestBytes(promptInput);
+    for (const m of this.history) n += this._entryBytes(m);
     return n;
   }
 
@@ -635,28 +695,84 @@ class AgentSession {
     return this._requestBytesFor(input);
   }
 
-  // Trim whole oldest TASKS (never individual messages) until the request
-  // fits the transport budget. Task boundaries are the explicit `_taskStart`
-  // markers on genuine user-task messages — tool feedback also uses the user
-  // role, so role alone cannot identify a boundary. Cutting only at
-  // boundaries keeps every tool call paired with its result. If the current
-  // task alone exceeds the budget, fail loudly instead of sending an
-  // unbounded request or silently dropping the user's own input.
-  // M2b: takes the task's prompt input (definitions + description
-  // snapshot) — never a fresh read, so the estimate matches the request.
-  enforceHistoryBudget(promptInput) {
-    while (this._requestBytesFor(promptInput) > HISTORY_BUDGET_BYTES) {
+  // The smallest request the NEXT task can produce: every older task can
+  // be dropped (enforceHistoryBudget), so what remains is the system
+  // prompt + tool definitions + the new user turn (`extraBytes`, supplied
+  // by the caller). Product submit checks compare THIS against the
+  // budget, so the pre-check and the run-time trimming follow one rule.
+  async minimumRequestBytes(workspace, taskEnvironment, extraBytes) {
+    let descriptionText = null;
+    if (this.descriptionPort) descriptionText = await this.descriptionPort.describeCommands();
+    const notes = this.environmentNotes
+      ? this.environmentNotes({ workspace: workspace || null, taskEnvironment: taskEnvironment || null })
+      : null;
+    let toolSnapshot = null;
+    try { toolSnapshot = createToolSnapshot(this.toolPort); } catch (e) { toolSnapshot = null; }
+    const input = this._promptInput(toolSnapshot, workspace, taskEnvironment, descriptionText, notes);
+    const extra = Number.isFinite(extraBytes) && extraBytes > 0 ? Math.ceil(extraBytes) : 0;
+    return this._baseRequestBytes(input) + extra;
+  }
+
+  // Over-budget ladder (docs/CONTEXT-MANAGEMENT.md §3.3, DECISIONS.md D9).
+  // Under budget → nothing changes (append-only, stable prefix). Over
+  // budget → act ONCE down to the low-water mark so later turns append
+  // again instead of trimming every turn:
+  //   (2) drop whole oldest TASKS (cut only at `_taskStart`, so every tool
+  //       call stays paired with its result);
+  //   (3) then elide older tool results of the current task (the most
+  //       recent ELIDE_KEEP_RECENT_RESULTS stay intact; copy-on-write;
+  //       assistant messages are NEVER touched — they replay byte-exact);
+  //   (4) still over the budget → throw.
+  // Returns { dropped, elided } (message counts) for callers and tests.
+  enforceHistoryBudget(promptInput, budget) {
+    const limit = Number.isInteger(budget) && budget > 0 ? budget : this.requestBudget;
+    const result = { dropped: 0, elided: 0 };
+    let total = this._requestBytesFor(promptInput);
+    if (total <= limit) return result;
+    const lowWater = Math.floor(limit * BUDGET_LOW_WATER_RATIO);
+    while (total > lowWater) {
       let cut = -1;
       for (let i = 1; i < this.history.length; i++) {
         if (this.history[i]._taskStart) { cut = i; break; }
       }
-      if (cut === -1) {
-        throw new Error(
-          'current task alone exceeds the history transport budget (' +
-          HISTORY_BUDGET_BYTES + ' bytes) — run `reset` to start a new session or narrow the task');
-      }
-      this.history.splice(0, cut); // drop the entire oldest task
+      if (cut === -1) break;
+      for (let i = 0; i < cut; i++) total -= this._entryBytes(this.history[i]);
+      this.history.splice(0, cut);
+      result.dropped += cut;
     }
+    if (total > lowWater) {
+      const elided = this._elideCurrentTaskToolResults(total, lowWater);
+      result.elided = elided.count;
+      total = elided.total;
+    }
+    if (total > limit) {
+      throw new Error(
+        'current task alone exceeds the history transport budget (' +
+        limit + ' bytes) — run `reset` to start a new session or narrow the task');
+    }
+    return result;
+  }
+
+  _elideCurrentTaskToolResults(total, target) {
+    let start = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i]._taskStart) { start = i; break; }
+    }
+    const candidates = [];
+    for (let i = start + 1; i < this.history.length; i++) {
+      if (isElidableToolResult(this.history[i])) candidates.push(i);
+    }
+    const eligible = candidates.slice(0, Math.max(0, candidates.length - ELIDE_KEEP_RECENT_RESULTS));
+    let count = 0;
+    for (const i of eligible) {
+      if (total <= target) break;
+      const entry = this.history[i];
+      const replacement = elidedToolResult(entry);
+      total += this._entryBytes(replacement) - this._entryBytes(entry);
+      this.history[i] = replacement;
+      count++;
+    }
+    return { count: count, total: total };
   }
 
   // Materialize semantic image parts into one-request provider payloads
@@ -822,6 +938,7 @@ class AgentSession {
     // asked/probed at most once per task run — no same-run loops.
     const imageAskCache = new Map();
     const maxTokens = this.maxTokens; // snapshot: fixed for this whole task
+    const requestBudget = this.requestBudget; // snapshot: fixed for this whole task
     try {
       // ---- the task's ONE tool/description snapshot (M2b) ----
       // Read once, here — every later consumer (prompt, request.tools,
@@ -867,7 +984,7 @@ class AgentSession {
           return;
         }
         try {
-          this.enforceHistoryBudget(promptInput);
+          this.enforceHistoryBudget(promptInput, requestBudget);
         } catch (e) {
           emit({ type: 'error', code: 'history_budget', message: e.message });
           end('error');
