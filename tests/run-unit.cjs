@@ -24,6 +24,8 @@ const SUITES = [
   'image-probe.test.mjs',
   // capability composition core
   'capability-composition.test.mjs',
+  // incremental capability package registration (wheel artifacts, skill upgrade rule)
+  'capability-packages.test.mjs',
   // public-entry contract surface (M3b review R1: the descriptor validators
   // and the skill-instance contract data real Product consumers read)
   'public-entry-contracts.test.mjs',
