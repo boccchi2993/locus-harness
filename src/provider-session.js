@@ -196,6 +196,11 @@ export function createProviderSessions(deps) {
     let frameSequence = providerSession.nextFrameSequence || 0;
     let normalizedSequence = providerSession.nextNormalizedSequence || 0;
     return {
+      // The sequence the NEXT normalized row will receive. Synchronous
+      // and side-effect free: the agent loop uses it to name a tool
+      // result's full-output file BEFORE writing the result
+      // (docs/CONTEXT-MANAGEMENT.md §3.1).
+      peekNextNormalizedSequence() { return normalizedSequence + 1; },
       async onUserMessage(text, userContent) {
         // Rich user content (docs/IMAGE-INPUT.md): the raw provider frame
         // and the normalized row keep SEMANTIC image parts (attachmentId +

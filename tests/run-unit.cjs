@@ -11,6 +11,7 @@ const SUITES = [
   'model-adapters.test.mjs',
   'model-adapters-image.test.mjs',
   'native-tools.test.mjs',
+  'tool-output-path.test.mjs',
   // agent loop
   'agent.test.mjs',
   'agent-approval.test.mjs',

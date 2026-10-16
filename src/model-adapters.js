@@ -58,6 +58,7 @@
 //  call time, so the live binding always resolves).
 // ============================================================
 import { makeParseError } from './model.js';
+import { nativeResultContent, toolOutputNote, TOOL_RESULT_MAX_CHARS } from './agent.js';
 
 // Auto dialect detection from the endpoint form (only used when the
 // configured dialect is 'auto'; an explicit dialect always wins):
@@ -622,12 +623,40 @@ function getProviderAdapter(config) {
 // Cross-provider continuation is intentionally semantic. It never forwards
 // a foreign raw protocol object (thinking signatures, vendor extensions,
 // tool-call wire wrappers, etc.) to a different adapter.
-function projectNormalizedHistory(messages, dialect) {
+// Cross-provider projection of normalized rows into neutral history.
+// options.toolOutputPathForRow(row) → path | null (Product-owned; the
+// same file the live run named, see docs/CONTEXT-MANAGEMENT.md §3.1).
+// Invariants:
+//   - genuine user turns carry the internal `_taskStart` marker, so the
+//     budget ladder can cut at task boundaries after a provider switch;
+//   - native tool results get the SAME untrusted-data framing and
+//     truncation as a live run (DECISIONS.md D1) — never the raw output;
+//   - text-fallback feedback rows (role 'user', kind 'tool_result') replay
+//     the exact feedback text that was sent, as a user turn — they have
+//     no provider tool-call id and are never turned into native results.
+function projectNormalizedHistory(messages, dialect, options) {
+  var pathForRow = options && typeof options.toolOutputPathForRow === 'function' ? options.toolOutputPathForRow : null;
   var out = [];
   for (const m of messages || []) {
     if (!m) continue;
+    if (m.kind === 'tool_result' && m.role === 'user') {
+      out.push({ role: 'user', content: typeof m.text === 'string' ? m.text : '' });
+      continue;
+    }
     if (m.kind === 'tool_result' || m.role === 'tool_result') {
-      out.push({ role: 'tool_result', toolCallId: m.toolCallId || '', toolName: m.toolName || '', content: String(m.toolResult == null ? (m.content || '') : m.toolResult), success: m.success !== false });
+      var full = String(m.toolResult == null ? (m.content || '') : m.toolResult);
+      var path = null;
+      if (pathForRow && full.length > TOOL_RESULT_MAX_CHARS) {
+        try { path = pathForRow(m); } catch (e) { path = null; }
+        if (!(typeof path === 'string' && path && !/[\r\n\]]/.test(path))) path = null;
+      }
+      var result = {
+        role: 'tool_result', toolCallId: m.toolCallId || '', toolName: m.toolName || '',
+        content: nativeResultContent(m.toolName || '', m.success !== false, full, path ? toolOutputNote(path) : null),
+        success: m.success !== false,
+      };
+      if (path) result._outputPath = path;
+      out.push(result);
       continue;
     }
     if (m.kind === 'tool_call' && Array.isArray(m.toolCalls)) {
@@ -643,22 +672,27 @@ function projectNormalizedHistory(messages, dialect) {
       }
       continue;
     }
+    var taskStart = (m.role || 'user') === 'user' && m.kind === 'message';
     // Rich user content survives cross-provider projection as SEMANTIC
     // parts (attachment refs, no base64). The target provider's
     // image-input gate decides per request whether the image crosses
     // its boundary — a text-only target gets the deterministic textual
     // notice, never a silent drop and never foreign wire shapes.
     if (Array.isArray(m.contentParts) && m.contentParts.length) {
-      out.push({
+      var rich = {
         role: m.role || 'user',
         content: m.contentParts.map(function (p) {
           if (p && p.type === 'image') return p;
           return { type: 'text', text: String(p && p.text || '') };
         }),
-      });
+      };
+      if (taskStart) rich._taskStart = true;
+      out.push(rich);
       continue;
     }
-    out.push({ role: m.role || 'user', content: typeof m.text === 'string' ? m.text : (typeof m.content === 'string' ? m.content : '') });
+    var plain = { role: m.role || 'user', content: typeof m.text === 'string' ? m.text : (typeof m.content === 'string' ? m.content : '') };
+    if (taskStart) plain._taskStart = true;
+    out.push(plain);
   }
   return out;
 }
