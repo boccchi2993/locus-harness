@@ -51,6 +51,31 @@ const ELIDE_KEEP_RECENT_RESULTS = 4;
 // Slack per tool for the provider wire wrapper around a definition.
 const TOOL_WIRE_OVERHEAD_BYTES = 64;
 const ELIDED_NOTICE = '[earlier tool output elided to fit the request budget';
+// Context-window budget (docs/CONTEXT-MANAGEMENT.md §3.2 stage 4, D5/D9):
+// the window is USER configuration; bytes-per-token is MEASURED from the
+// provider's reported input tokens, never inferred from a model name.
+const CONTEXT_SAFETY_RATIO = 0.9;
+const DEFAULT_BYTES_PER_TOKEN = 2;   // conservative until measured
+const MIN_BYTES_PER_TOKEN = 1;
+const MAX_BYTES_PER_TOKEN = 6;
+const TOKEN_CALIBRATION_SAMPLES = 5;
+
+// Provider-neutral input token count of one response, or null.
+//   OpenAI dialect:    prompt_tokens (already includes cached tokens)
+//   Anthropic dialect: input_tokens + cache_read_input_tokens
+//                      + cache_creation_input_tokens
+function usageInputTokens(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  if (Number.isFinite(usage.prompt_tokens) && usage.prompt_tokens > 0) return usage.prompt_tokens;
+  if (Number.isFinite(usage.input_tokens)) {
+    const n = usage.input_tokens
+      + (Number.isFinite(usage.cache_read_input_tokens) ? usage.cache_read_input_tokens : 0)
+      + (Number.isFinite(usage.cache_creation_input_tokens) ? usage.cache_creation_input_tokens : 0);
+    return n > 0 ? n : null;
+  }
+  return null;
+}
+
 // Default output budget per model request. Per DECISIONS.md D5 this is
 // user configuration (deps.maxTokens), never inferred from the model name.
 const DEFAULT_MAX_TOKENS = 8192;
@@ -563,6 +588,11 @@ class AgentSession {
       throw new Error('AgentSession: requestBudgetBytes must be a positive integer');
     }
     this.requestBudget = d.requestBudgetBytes != null ? d.requestBudgetBytes : HISTORY_BUDGET_BYTES;
+    if (d.contextWindowTokens != null && !(Number.isInteger(d.contextWindowTokens) && d.contextWindowTokens > 0)) {
+      throw new Error('AgentSession: contextWindowTokens must be a positive integer or null');
+    }
+    this.contextWindow = d.contextWindowTokens != null ? d.contextWindowTokens : null;
+    this._bytesPerTokenSamples = [];
   }
 
   setPersistenceContext(context) { this.persistence = context || null; }
@@ -586,6 +616,51 @@ class AgentSession {
   }
 
   requestBudgetBytes() { return this.requestBudget; }
+
+  // Optional model context window in tokens (null = unknown → only the
+  // transport budget applies). A running task keeps its snapshot.
+  setContextWindow(n) {
+    if (n != null && !(Number.isInteger(n) && n > 0)) {
+      throw new Error('AgentSession: contextWindowTokens must be a positive integer or null');
+    }
+    this.contextWindow = n != null ? n : null;
+  }
+
+  // Calibration belongs to one model/tokenizer: the Product clears it when
+  // the provider endpoint, model or dialect changes.
+  resetTokenCalibration() { this._bytesPerTokenSamples = []; }
+
+  bytesPerToken() {
+    const s = this._bytesPerTokenSamples;
+    if (!s.length) return DEFAULT_BYTES_PER_TOKEN;
+    const avg = s.reduce((a, b) => a + b, 0) / s.length;
+    return Math.min(MAX_BYTES_PER_TOKEN, Math.max(MIN_BYTES_PER_TOKEN, avg));
+  }
+
+  _effectiveBudget(requestBudget, contextWindow, maxTokens) {
+    if (contextWindow == null) return requestBudget;
+    const tokens = contextWindow - maxTokens;
+    if (tokens <= 0) return 0;
+    return Math.min(requestBudget, Math.floor(tokens * this.bytesPerToken() * CONTEXT_SAFETY_RATIO));
+  }
+
+  // The budget the NEXT task would run with (Product submit checks).
+  effectiveRequestBudgetBytes() {
+    return this._effectiveBudget(this.requestBudget, this.contextWindow, this.maxTokens);
+  }
+
+  // One calibration sample per successful response: request bytes /
+  // reported input tokens. Requests carrying images are skipped — image
+  // bytes and image tokens have no stable ratio.
+  _recordTokenSample(sentBytes, hadImages, usage) {
+    if (hadImages) return;
+    const tokens = usageInputTokens(usage);
+    if (!tokens || !(sentBytes > 0)) return;
+    const ratio = sentBytes / tokens;
+    if (!Number.isFinite(ratio)) return;
+    this._bytesPerTokenSamples.push(ratio);
+    while (this._bytesPerTokenSamples.length > TOKEN_CALIBRATION_SAMPLES) this._bytesPerTokenSamples.shift();
+  }
 
   async _persist(method, payload, options) {
     const p = this.persistence;
@@ -963,6 +1038,7 @@ class AgentSession {
     const imageAskCache = new Map();
     const maxTokens = this.maxTokens; // snapshot: fixed for this whole task
     const requestBudget = this.requestBudget; // snapshot: fixed for this whole task
+    const contextWindow = this.contextWindow; // snapshot
     try {
       // ---- the task's ONE tool/description snapshot (M2b) ----
       // Read once, here — every later consumer (prompt, request.tools,
@@ -1002,15 +1078,28 @@ class AgentSession {
         end('iteration_limit');
       };
 
+      if (contextWindow != null && contextWindow <= maxTokens) {
+        emit({
+          type: 'error', code: 'history_budget',
+          message: 'context window (' + contextWindow + ' tokens) must be larger than max output tokens (' + maxTokens + ') — adjust the settings',
+        });
+        end('error');
+        return;
+      }
+
       for (;;) {
         if (toolCallsUsed >= MAX_TOOL_ITERATIONS) {
           iterationLimitEnd('');
           return;
         }
+        const budget = this._effectiveBudget(requestBudget, contextWindow, maxTokens);
         try {
-          this.enforceHistoryBudget(promptInput, requestBudget);
+          this.enforceHistoryBudget(promptInput, budget);
         } catch (e) {
-          emit({ type: 'error', code: 'history_budget', message: e.message });
+          emit({
+            type: 'error', code: 'history_budget',
+            message: e.message + (budget < requestBudget ? ' (limited by the context window setting: ' + contextWindow + ' tokens)' : ''),
+          });
           end('error');
           return;
         }
@@ -1081,6 +1170,8 @@ class AgentSession {
           }
         }
         let envelope;
+        let sentBytes = 0;
+        let sentHadImages = false;
         try {
           const request = {
             max_tokens: maxTokens,
@@ -1090,6 +1181,8 @@ class AgentSession {
           // Model-visible tool definitions are THIS task's frozen
           // snapshot; the adapter maps them onto the provider wire shape.
           request.tools = tools;
+          sentBytes = this._requestBytesFor(promptInput);
+          sentHadImages = historyImageParts(stripInternalFields(this.history)).length > 0;
           // FINAL liveness check before the provider side effect — no
           // await may sit between this check and the model call.
           if (controller.signal.aborted) {
@@ -1125,6 +1218,8 @@ class AgentSession {
           end(sessionChanged() ? 'session_changed' : 'cancelled');
           return;
         }
+
+        this._recordTokenSample(sentBytes, sentHadImages, envelope.usage);
 
         // Provider-native replay state, not just visible text
         // (docs/MODEL-PROTOCOL.md): reasoning blocks, tool call blocks,
@@ -1444,4 +1539,5 @@ export {
   AgentSession, buildSystemPrompt, HISTORY_BUDGET_BYTES, MAX_TOOL_ITERATIONS,
   parseToolCall, stripInternalFields, truncateFor,
   nativeResultContent, toolOutputNote, TOOL_RESULT_MAX_CHARS,
+  usageInputTokens,
 };

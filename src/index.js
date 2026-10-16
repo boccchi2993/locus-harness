@@ -223,6 +223,7 @@ export function harnessCapabilities() {
   declaration.capabilities.imageInputGate = true;       // the gate trio ships here
   declaration.capabilities.capabilityComposition = true; // the composition core ships here
   declaration.capabilities.requestBudget = true;        // setRequestBudget / minimumRequestBytes / low-water trim + elision
+  declaration.capabilities.contextWindowBudget = true;  // setContextWindow / usage-calibrated bytes-per-token / min(transport, context)
 
   return deepFreezeDeclaration(declaration);
 }
