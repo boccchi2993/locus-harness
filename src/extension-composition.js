@@ -304,6 +304,8 @@ class SkillSourceStore {
     if (!s || s.version !== version) return null;
     return { version: s.version, bytes: s.bytes.slice(), text: s.text };
   }
+
+  remove(skillId) { this._sources.delete(skillId); }
 }
 
 // ---------- MCP requirement descriptor ----------
@@ -443,9 +445,38 @@ function unregisterPluginRuntimeProvider(runtime) {
 
 // Structural validation of one prepared payload (trusted harness data,
 // but relative paths are load-bearing for the runtime install step).
+// A payload carries EXACTLY ONE of files / wheels: files are the classic
+// provider-installed text files; wheels is the package path — verified
+// wheel METADATA only (the bytes stay in the manager's artifact registry,
+// they never travel in the payload).
 function validatePluginPayload(plugin, payload) {
   if (!payload || typeof payload !== 'object') {
     throw extensionResolutionError('plugin ' + plugin.id + ': runtime provider returned no payload');
+  }
+  const imports = payload.imports;
+  if (!Array.isArray(imports) || imports.some((n) => !EXTENSION_PY_MODULE_PATTERN.test(String(n)))) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': payload.imports must be an array of module names');
+  }
+  const hasFiles = payload.files !== undefined;
+  const hasWheels = payload.wheels !== undefined;
+  if (hasFiles === hasWheels) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': payload must carry exactly one of files / wheels');
+  }
+  if (hasWheels) {
+    const w = payload.wheels;
+    if (!Array.isArray(w) || w.length !== 1 || !w[0] || typeof w[0] !== 'object') {
+      throw extensionResolutionError('plugin ' + plugin.id + ': payload.wheels must hold exactly one wheel');
+    }
+    const m = w[0];
+    if (typeof m.filename !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.whl$/.test(m.filename)
+      || m.format !== 'python-wheel' || !Number.isInteger(m.size) || m.size < 0
+      || typeof m.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.sha256)) {
+      throw extensionResolutionError('plugin ' + plugin.id + ': invalid wheel metadata');
+    }
+    if (m.bytes !== undefined) {
+      throw extensionResolutionError('plugin ' + plugin.id + ': wheel bytes never travel in the payload');
+    }
+    return { wheels: [{ filename: m.filename, format: m.format, size: m.size, sha256: m.sha256 }], imports: imports.map(String) };
   }
   const files = payload.files;
   if (!files || typeof files !== 'object' || Array.isArray(files)) {
@@ -462,10 +493,6 @@ function validatePluginPayload(plugin, payload) {
     }
     outFiles[rel] = files[relRaw];
   }
-  const imports = payload.imports;
-  if (!Array.isArray(imports) || imports.some((n) => !EXTENSION_PY_MODULE_PATTERN.test(String(n)))) {
-    throw extensionResolutionError('plugin ' + plugin.id + ': payload.imports must be an array of module names');
-  }
   return { files: outFiles, imports: imports.map(String) };
 }
 
@@ -474,7 +501,10 @@ function validatePluginPayload(plugin, payload) {
 // to decide whether the interpreter must be rebuilt for the NEXT task.
 function pythonExtensionKeyOf(plugins) {
   const py = (plugins || []).filter((p) => p.runtime === 'python')
-    .map((p) => p.id + '@' + p.version).sort();
+    .map((p) => {
+      const w = p.payload && Array.isArray(p.payload.wheels) && p.payload.wheels[0];
+      return p.id + '@' + p.version + (w ? '#' + w.sha256 : '');
+    }).sort();
   return py.length ? py.join('|') : null;
 }
 
@@ -520,6 +550,11 @@ class CapabilityManager {
     const portOk = !!instances && ['readBytes', 'writeBytes', 'removeDir', 'stat']
       .every((m) => typeof instances[m] === 'function');
     this.skillInstances = portOk ? instances : null;
+    // Package registrations (docs/CAPABILITY-INSTALL.md §6): capabilityId ->
+    // { plugins: [ids], skills: [ids], mcps: [ids] } — the components that
+    // arrived with that package — and pluginId -> verified wheel artifact.
+    this._packages = new Map();
+    this._artifacts = new Map(); // pluginId -> { filename, format, size, sha256, bytes }
   }
 
   // ---- catalog view (UI / introspection) ----
@@ -581,7 +616,132 @@ class CapabilityManager {
     if (sources !== undefined) this.skillSources = store;
     this._enabled = new Map();
     this._mcpStates = new Map();
+    this._packages = new Map();
+    this._artifacts = new Map();
   }
+
+  // Additive registration of ONE imported capability package
+  // (docs/CAPABILITY-INSTALL.md §6). Validates everything before touching
+  // any manager state; other capabilities' enabled state is untouched.
+  //   pkg = {
+  //     capability, plugins: [], skills: [], mcps: [],   // raw descriptors
+  //     sources:   { [skillId]: { version, source } },   // default skill text
+  //     artifacts: { [pluginId]: { filename, format, size, sha256, bytes } },
+  //   }
+  // A package is self-contained: every plugin / skill the capability
+  // references must arrive in the same package. A component id that is
+  // already registered must be IDENTICAL (same descriptor, same artifact
+  // sha256, same skill source) — otherwise the registration is refused.
+  async registerPackage(pkg) {
+    const p = pkg || {};
+    const cap = validateCapabilityDescriptor(p.capability);
+    if (this._capabilities.has(cap.id)) {
+      throw extensionDescriptorError('capability already registered: ' + cap.id);
+    }
+    const byId = (list, validate, kind) => {
+      const out = new Map();
+      for (const raw of (list || [])) {
+        const d = validate(raw);
+        if (out.has(d.id)) throw extensionDescriptorError('duplicate ' + kind + ' id in package ' + cap.id + ': ' + d.id);
+        out.set(d.id, d);
+      }
+      return out;
+    };
+    const plugins = byId(p.plugins, validatePluginDescriptor, 'plugin');
+    const skills = byId(p.skills, validateSkillDescriptor, 'skill');
+    const mcps = byId(p.mcps, validateMcpDescriptor, 'mcp');
+    for (const ref of cap.plugins) {
+      if (!plugins.has(ref)) throw extensionDescriptorError('package ' + cap.id + ' does not ship referenced plugin: ' + ref);
+    }
+    for (const ref of cap.skills) {
+      if (!skills.has(ref)) throw extensionDescriptorError('package ' + cap.id + ' does not ship referenced skill: ' + ref);
+    }
+    const sources = p.sources && typeof p.sources === 'object' ? p.sources : {};
+    for (const [id, d] of skills) {
+      const s = sources[id];
+      if (!s || typeof s !== 'object' || s.version !== d.version || typeof s.source !== 'string') {
+        throw extensionDescriptorError('package ' + cap.id + ': skill ' + id + ' needs a default source { version: "' + d.version + '", source }');
+      }
+    }
+    const artifactsIn = p.artifacts && typeof p.artifacts === 'object' ? p.artifacts : {};
+    const artifacts = new Map();
+    for (const [id, d] of plugins) {
+      const a = artifactsIn[id];
+      if (d.runtime !== 'python') {
+        throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' runtime ' + d.runtime + ' is not installable from a package');
+      }
+      if (!a || typeof a !== 'object') throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' has no wheel artifact');
+      if (typeof a.filename !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.whl$/.test(a.filename)) {
+        throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' artifact filename must be a plain .whl basename');
+      }
+      if (a.format !== 'python-wheel') throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' artifact format must be "python-wheel"');
+      if (!(a.bytes instanceof Uint8Array) || !Number.isInteger(a.size) || a.bytes.byteLength !== a.size) {
+        throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' artifact bytes do not match the declared size');
+      }
+      if (typeof a.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(a.sha256) || (await sha256Hex(a.bytes)) !== a.sha256) {
+        throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' artifact sha256 does not match its bytes');
+      }
+      artifacts.set(id, { filename: a.filename, format: a.format, size: a.size, sha256: a.sha256, bytes: new Uint8Array(a.bytes) });
+    }
+    // Conflicts with already-registered components.
+    const same = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+    for (const [id, d] of plugins) {
+      if (this._plugins.has(id) && (!same(this._plugins.get(id), d)
+        || !this._artifacts.has(id) || this._artifacts.get(id).sha256 !== artifacts.get(id).sha256)) {
+        throw extensionDescriptorError('package ' + cap.id + ': plugin ' + id + ' conflicts with an already registered plugin of the same id');
+      }
+    }
+    for (const [id, d] of skills) {
+      if (this._skills.has(id)) {
+        const existing = this.skillSources.sourceOf(id, d.version);
+        if (!same(this._skills.get(id), d) || !existing || existing.text !== sources[id].source) {
+          throw extensionDescriptorError('package ' + cap.id + ': skill ' + id + ' conflicts with an already registered skill of the same id');
+        }
+      }
+    }
+    for (const [id, d] of mcps) {
+      if (this._mcps.has(id) && !same(this._mcps.get(id), d)) {
+        throw extensionDescriptorError('package ' + cap.id + ': mcp ' + id + ' conflicts with an already registered mcp of the same id');
+      }
+    }
+    // Validate skill sources BEFORE committing (define() enforces the size bound).
+    const probe = new SkillSourceStore();
+    for (const [id, d] of skills) probe.define(id, d.version, sources[id].source);
+    // Commit.
+    for (const [id, d] of plugins) { this._plugins.set(id, d); this._artifacts.set(id, artifacts.get(id)); }
+    for (const [id, d] of skills) { this._skills.set(id, d); this.skillSources.define(id, d.version, sources[id].source); }
+    for (const [id, d] of mcps) this._mcps.set(id, d);
+    this._capabilities.set(cap.id, cap);
+    this._packages.set(cap.id, { plugins: [...plugins.keys()], skills: [...skills.keys()], mcps: [...mcps.keys()] });
+  }
+
+  // Remove a package registration. keepInstances: true (uninstall and
+  // version replacement) drops the enabled entry WITHOUT deleting the
+  // capability's skill instance directory; false behaves like disable()
+  // first. Components still referenced by another capability stay.
+  async unregisterPackage(capabilityId, opts) {
+    const owned = this._packages.get(capabilityId);
+    if (!owned) throw extensionResolutionError('not a registered package: ' + String(capabilityId));
+    const keep = !!(opts && opts.keepInstances);
+    if (this._enabled.has(capabilityId)) {
+      if (keep) this._enabled.delete(capabilityId);
+      else await this.disable(capabilityId);
+    }
+    this._capabilities.delete(capabilityId);
+    this._packages.delete(capabilityId);
+    const stillUsed = (field, id) => [...this._capabilities.values()].some((c) => c[field].includes(id));
+    for (const id of owned.plugins) {
+      if (!stillUsed('plugins', id)) { this._plugins.delete(id); this._artifacts.delete(id); }
+    }
+    for (const id of owned.skills) {
+      if (!stillUsed('skills', id)) { this._skills.delete(id); this.skillSources.remove(id); }
+    }
+    for (const id of owned.mcps) {
+      if (!stillUsed('mcps', id)) { this._mcps.delete(id); this._mcpStates.delete(id); }
+    }
+  }
+
+  isPackage(capabilityId) { return this._packages.has(capabilityId); }
 
   capabilityState(capabilityId) {
     const entry = this._enabled.get(capabilityId);
@@ -658,6 +818,19 @@ class CapabilityManager {
     let failure = null;
     for (const pluginId of cap.plugins) {
       const descriptor = this._plugins.get(pluginId);
+      const artifact = this._artifacts.get(pluginId);
+      if (artifact) {
+        // Package plugin: the verified wheel registered with the package.
+        // Metadata only — the bytes stay in this._artifacts (§6).
+        entry.plugins.set(pluginId, {
+          descriptor: descriptor,
+          payload: validatePluginPayload(descriptor, {
+            wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256 }],
+            imports: descriptor.provides.pythonImports.slice(),
+          }),
+        });
+        continue;
+      }
       const provider = pluginRuntimeProvider(descriptor.runtime);
       if (!provider) {
         failure = 'plugin ' + pluginId + ': no runtime provider registered for "' + descriptor.runtime + '"';
@@ -731,6 +904,9 @@ class CapabilityManager {
         && plans.every((p) => marker.skills.some((m) => m
           && m.id === p.skillId && m.sourceVersion === p.version && m.sourceHash === p.hash));
       if (compatible) return null; // REUSE: the user's instances stay exactly as they are
+      if (marker.capabilityId === cap.id && Array.isArray(marker.skills)) {
+        return this._upgradeSkillInstances(cap, plans, marker, markerRel);
+      }
       return 'capability ' + cap.id + ': installed skill instances do not match the current catalog'
         + ' (installed capability version ' + JSON.stringify(marker.capabilityVersion || null) + ')'
         + '; remove and re-add the capability to reset its guidance';
@@ -753,6 +929,58 @@ class CapabilityManager {
     } catch (e) {
       try { await storage.removeDir(cap.id); } catch (ignored) { /* best-effort rollback */ }
       return 'capability ' + cap.id + ': skill materialization failed: ' + (e && e.message ? e.message : String(e));
+    }
+    return null;
+  }
+
+  // Version upgrade of an installed capability (docs/CAPABILITY-INSTALL.md
+  // §6.3). For every skill of the NEW version:
+  //   in old marker, file present, file hash == old sourceHash (unmodified)
+  //       -> overwrite with the new default
+  //   in old marker, file present, hash differs (user customized) -> keep
+  //   in old marker, file absent (user deleted it)                -> keep absent
+  //   not in old marker (new skill), file absent                 -> write default
+  //   not in old marker, file present                            -> keep (never overwrite user content)
+  // Skills only in the old marker are left on disk as orphans. The marker
+  // is rewritten LAST with the new version's source hashes. On failure the
+  // overwritten files are restored and the old marker stays.
+  async _upgradeSkillInstances(cap, plans, marker, markerRel) {
+    const storage = this.skillInstances;
+    const old = new Map();
+    for (const m of marker.skills) if (m && typeof m.id === 'string') old.set(m.id, m);
+    const overwritten = []; // { rel, previous }
+    const written = [];     // { rel, hash }
+    try {
+      for (const p of plans) {
+        const rel = cap.id + '/' + p.skillId + '.skill';
+        let current = null;
+        try { current = await storage.readBytes(rel); } catch (e) {
+          if (!e || e.name !== 'NotFoundError') throw e;
+          current = null;
+        }
+        const prev = old.get(p.skillId);
+        if (prev) {
+          if (current === null) continue;
+          if ((await sha256Hex(current)) !== prev.sourceHash) continue;
+          if (prev.sourceHash === p.hash) continue;
+          overwritten.push({ rel: rel, previous: current });
+        } else if (current !== null) {
+          continue;
+        }
+        await storage.writeBytes(rel, p.bytes);
+        written.push({ rel: rel, hash: p.hash });
+      }
+      for (const w of written) {
+        if ((await sha256Hex(await storage.readBytes(w.rel))) !== w.hash) {
+          throw new Error('verification failed for ' + SKILL_INSTANCE_ROOT + '/' + w.rel);
+        }
+      }
+      await storage.writeBytes(markerRel, new TextEncoder().encode(skillInstanceMarkerPayload(cap, plans)));
+    } catch (e) {
+      for (const o of overwritten.reverse()) {
+        try { await storage.writeBytes(o.rel, o.previous); } catch (ignored) { /* best-effort restore */ }
+      }
+      return 'capability ' + cap.id + ': skill instance upgrade failed: ' + (e && e.message ? e.message : String(e));
     }
     return null;
   }
@@ -887,7 +1115,9 @@ class CapabilityManager {
         runtime: resolved.descriptor.runtime,
         authority: resolved.descriptor.authority,
         provides: this._freeze(Object.assign({}, resolved.descriptor.provides)),
-        payload: this._freeze({ files: this._freeze(Object.assign({}, resolved.payload.files)), imports: resolved.payload.imports.slice() }),
+        payload: this._freeze(resolved.payload.wheels
+          ? { wheels: resolved.payload.wheels.map((w) => ({ filename: w.filename, format: w.format, size: w.size, sha256: w.sha256 })), imports: resolved.payload.imports.slice() }
+          : { files: this._freeze(Object.assign({}, resolved.payload.files)), imports: resolved.payload.imports.slice() }),
       }));
     }
     const mcpList = [];
@@ -910,6 +1140,7 @@ class CapabilityManager {
   // (strict mode throws) — the snapshot stays exactly what the task
   // started with.
   _freeze(value) {
+    if (ArrayBuffer.isView(value)) return value; // typed arrays with elements cannot be frozen
     if (Array.isArray(value)) {
       value.forEach((v) => this._freeze(v));
       return Object.freeze(value);
@@ -930,6 +1161,18 @@ class CapabilityManager {
     const modules = [];
     for (const p of source.plugins) {
       if (p.runtime !== 'python') continue;
+      if (p.payload.wheels) {
+        const artifact = this._artifacts.get(p.id);
+        if (!artifact || artifact.sha256 !== p.payload.wheels[0].sha256) {
+          throw extensionResolutionError('plugin ' + p.id + ': wheel bytes for ' + p.payload.wheels[0].sha256 + ' are not registered');
+        }
+        modules.push(this._freeze({
+          pluginId: p.id,
+          wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256, bytes: artifact.bytes.slice() }],
+          imports: p.payload.imports.slice(),
+        }));
+        continue;
+      }
       modules.push(this._freeze({
         pluginId: p.id,
         files: Object.assign({}, p.payload.files),
