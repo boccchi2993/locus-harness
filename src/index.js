@@ -217,6 +217,7 @@ export function harnessCapabilities() {
   // Semantic capabilities — implementation facts, each pinned by suites.
   declaration.capabilities.nativeToolCalls = true;      // native tool round trip
   declaration.capabilities.textFallbackStrict = true;   // strict fence rules
+  declaration.capabilities.toolOutputPath = true;       // run option toolOutputPath + peekNextNormalizedSequence + projection option
   declaration.capabilities.taskEventIdentity = true;    // runner identity stamping
   declaration.capabilities.providerReplay = true;       // real validators
   declaration.capabilities.imageInputGate = true;       // the gate trio ships here

@@ -145,6 +145,13 @@ function validateNormalizedPrefix(conversationId, rows) {
     if (row.kind === 'tool_call' && calls.length) {
       if (pending) throw replayValidationError('normalized_tool_batch_dangling', 'normalized history starts a tool batch before the previous one completed');
       pending = { ids: new Set(calls), seen: new Set() };
+    } else if (row.kind === 'tool_result' && row.role === 'user') {
+      // Text-fallback feedback: a user turn carrying the <tool_result>
+      // text. It has no provider tool-call id to pair, but it may not
+      // interrupt a pending native batch.
+      if (pending) {
+        throw replayValidationError('normalized_tool_result_invalid', 'text-fallback tool feedback interrupts a pending tool batch');
+      }
     } else if (row.kind === 'tool_result' || row.role === 'tool_result') {
       if (!pending || !pending.ids.has(row.toolCallId) || pending.seen.has(row.toolCallId)) {
         throw replayValidationError('normalized_tool_result_invalid', 'normalized tool result is not paired with its tool call');
