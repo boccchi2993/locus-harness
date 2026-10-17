@@ -31,9 +31,10 @@
 //      TaskEnvironment builds,
 //    - SkillInstanceWorkspace — the task-bound approval-guarded VFS
 //      provider mounted at /home/locus/.skills on task forks,
-//    - the PluginRuntimeProvider seam — a generic per-runtime binding
-//      (python / javascript / wasm) so future verified loaders plug in
-//      without touching the Capability / Skill / Agent model.
+//    - wheel-only plugin payloads (D10 §6): a plugin enters Python only
+//      as a verified wheel artifact registered with its capability
+//      package via registerPackage. The source-text (files) payload
+//      path and the PluginRuntimeProvider seam are deleted.
 //
 //  HARD invariants (pinned by tests/capability-composition.test.cjs):
 //    - Plugin v1 descriptor authority === "none"; any other authority
@@ -407,48 +408,12 @@ const MCP_CATALOG = Object.freeze([]);
 const CAPABILITY_STATES = Object.freeze(['disabled', 'needs-connection', 'ready', 'error']);
 const MCP_STATES = Object.freeze(['connected', 'needs-connection', 'unavailable']);
 
-// ---------- PluginRuntimeProvider seam ----------
-// A runtime provider binds a plugin descriptor to its runtime. V1
-// defines the GENERIC interface only — exactly one provider kind is ever
-// exercised (python, by tests); javascript/wasm stay future seams. The
-// interface is intentionally small and real-need-driven:
-//
-//   provider.prepare(plugin, context) -> Promise<{
-//     files:   { relativePath: text, ... },   // installed into the runtime
-//     imports: [moduleName, ...],             // smoke-imported before READY
-//   }>
-//
-// A future verified wheel loader implements the same seam without any
-// change to Capability / Skill / Agent code. Providers are registered
-// per runtime; a plugin whose runtime has no provider fails capability
-// RESOLUTION (state "error") — never a silent no-op and never a lazy
-// download.
-const PLUGIN_RUNTIME_PROVIDERS = new Map();
-
-function registerPluginRuntimeProvider(runtime, provider) {
-  if (!PLUGIN_RUNTIMES.includes(runtime)) {
-    throw extensionDescriptorError('unknown plugin runtime: ' + String(runtime));
-  }
-  if (!provider || typeof provider.prepare !== 'function') {
-    throw extensionDescriptorError('plugin runtime provider for ' + runtime + ' needs a prepare(plugin, context) function');
-  }
-  PLUGIN_RUNTIME_PROVIDERS.set(runtime, provider);
-}
-
-function pluginRuntimeProvider(runtime) {
-  return PLUGIN_RUNTIME_PROVIDERS.get(runtime) || null;
-}
-
-function unregisterPluginRuntimeProvider(runtime) {
-  PLUGIN_RUNTIME_PROVIDERS.delete(runtime);
-}
-
 // Structural validation of one prepared payload (trusted harness data,
-// but relative paths are load-bearing for the runtime install step).
-// A payload carries EXACTLY ONE of files / wheels: files are the classic
-// provider-installed text files; wheels is the package path — verified
-// wheel METADATA only (the bytes stay in the manager's artifact registry,
-// they never travel in the payload).
+// but wheel metadata is load-bearing for the runtime install step).
+// A payload carries EXACTLY ONE verified wheel — metadata only: the bytes
+// stay in the manager's artifact registry, they never travel in the
+// payload. Source-text (files) payloads are rejected (D10 §6: plugins
+// install only from capability packages, never from synthesized text).
 function validatePluginPayload(plugin, payload) {
   if (!payload || typeof payload !== 'object') {
     throw extensionResolutionError('plugin ' + plugin.id + ': runtime provider returned no payload');
@@ -457,43 +422,26 @@ function validatePluginPayload(plugin, payload) {
   if (!Array.isArray(imports) || imports.some((n) => !EXTENSION_PY_MODULE_PATTERN.test(String(n)))) {
     throw extensionResolutionError('plugin ' + plugin.id + ': payload.imports must be an array of module names');
   }
-  const hasFiles = payload.files !== undefined;
-  const hasWheels = payload.wheels !== undefined;
-  if (hasFiles === hasWheels) {
-    throw extensionResolutionError('plugin ' + plugin.id + ': payload must carry exactly one of files / wheels');
+  if (payload.files !== undefined) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': source-text payloads are no longer supported (wheel artifacts only)');
   }
-  if (hasWheels) {
-    const w = payload.wheels;
-    if (!Array.isArray(w) || w.length !== 1 || !w[0] || typeof w[0] !== 'object') {
-      throw extensionResolutionError('plugin ' + plugin.id + ': payload.wheels must hold exactly one wheel');
-    }
-    const m = w[0];
-    if (typeof m.filename !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.whl$/.test(m.filename)
-      || m.format !== 'python-wheel' || !Number.isInteger(m.size) || m.size < 0
-      || typeof m.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.sha256)) {
-      throw extensionResolutionError('plugin ' + plugin.id + ': invalid wheel metadata');
-    }
-    if (m.bytes !== undefined) {
-      throw extensionResolutionError('plugin ' + plugin.id + ': wheel bytes never travel in the payload');
-    }
-    return { wheels: [{ filename: m.filename, format: m.format, size: m.size, sha256: m.sha256 }], imports: imports.map(String) };
+  if (payload.wheels === undefined) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': payload must carry exactly one wheel');
   }
-  const files = payload.files;
-  if (!files || typeof files !== 'object' || Array.isArray(files)) {
-    throw extensionResolutionError('plugin ' + plugin.id + ': payload.files must be an object');
+  const w = payload.wheels;
+  if (!Array.isArray(w) || w.length !== 1 || !w[0] || typeof w[0] !== 'object') {
+    throw extensionResolutionError('plugin ' + plugin.id + ': payload.wheels must hold exactly one wheel');
   }
-  const outFiles = {};
-  for (const relRaw of Object.keys(files)) {
-    const rel = String(relRaw);
-    if (!rel || rel.startsWith('/') || rel.includes('\\') || rel.split('/').includes('..')) {
-      throw extensionResolutionError('plugin ' + plugin.id + ': invalid payload file path: ' + rel);
-    }
-    if (typeof files[relRaw] !== 'string') {
-      throw extensionResolutionError('plugin ' + plugin.id + ': payload file ' + rel + ' must be UTF-8 text');
-    }
-    outFiles[rel] = files[relRaw];
+  const m = w[0];
+  if (typeof m.filename !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.whl$/.test(m.filename)
+    || m.format !== 'python-wheel' || !Number.isInteger(m.size) || m.size < 0
+    || typeof m.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.sha256)) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': invalid wheel metadata');
   }
-  return { files: outFiles, imports: imports.map(String) };
+  if (m.bytes !== undefined) {
+    throw extensionResolutionError('plugin ' + plugin.id + ': wheel bytes never travel in the payload');
+  }
+  return { wheels: [{ filename: m.filename, format: m.format, size: m.size, sha256: m.sha256 }], imports: imports.map(String) };
 }
 
 // Stable identity of the python-side extension set (which plugin
@@ -792,15 +740,16 @@ class CapabilityManager {
   }
 
   // ---- enable ----
-  // 1. validate + resolve plugins (runtime provider prepares payloads)
+  // 1. validate + resolve plugins (wheel-only, D10 §6: every plugin must
+  //    have a verified wheel artifact registered with its package)
   // 2. resolve skills (definitions) + materialize capability-private
   //    durable instances (reuse a compatible install, else build one)
   // 3. collect MCP requirements
   // 4. dedupe by id (Map semantics — shared components stay shared;
   //    skill INSTANCES are per-capability and never deduped)
   // 5. compute state (error > needs-connection > ready)
-  // Local resolution failure (e.g. no runtime provider for a python
-  // plugin, a provider that fails, or a skill materialization fault)
+  // Local resolution failure (e.g. a python plugin whose verified wheel
+  // artifact is not registered, or a skill materialization fault)
   // does NOT throw: the capability is recorded with state "error" and
   // contributes nothing to task environments. Unknown ids and invalid
   // state transitions throw.
@@ -819,30 +768,19 @@ class CapabilityManager {
     for (const pluginId of cap.plugins) {
       const descriptor = this._plugins.get(pluginId);
       const artifact = this._artifacts.get(pluginId);
-      if (artifact) {
-        // Package plugin: the verified wheel registered with the package.
-        // Metadata only — the bytes stay in this._artifacts (§6).
-        entry.plugins.set(pluginId, {
-          descriptor: descriptor,
-          payload: validatePluginPayload(descriptor, {
-            wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256 }],
-            imports: descriptor.provides.pythonImports.slice(),
-          }),
-        });
-        continue;
-      }
-      const provider = pluginRuntimeProvider(descriptor.runtime);
-      if (!provider) {
-        failure = 'plugin ' + pluginId + ': no runtime provider registered for "' + descriptor.runtime + '"';
+      if (!artifact) {
+        failure = 'plugin ' + pluginId + ': no verified wheel artifact is registered (plugins install only from capability packages)';
         break;
       }
-      try {
-        const payload = validatePluginPayload(descriptor, await provider.prepare(descriptor, { capabilityId: cap.id }));
-        entry.plugins.set(pluginId, { descriptor: descriptor, payload: payload });
-      } catch (e) {
-        failure = 'plugin ' + pluginId + ' failed to prepare: ' + (e && e.message ? e.message : String(e));
-        break;
-      }
+      // Package plugin: the verified wheel registered with the package.
+      // Metadata only — the bytes stay in this._artifacts (§6).
+      entry.plugins.set(pluginId, {
+        descriptor: descriptor,
+        payload: validatePluginPayload(descriptor, {
+          wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256 }],
+          imports: descriptor.provides.pythonImports.slice(),
+        }),
+      });
     }
     if (!failure) {
       for (const skillId of cap.skills) {
@@ -1115,9 +1053,10 @@ class CapabilityManager {
         runtime: resolved.descriptor.runtime,
         authority: resolved.descriptor.authority,
         provides: this._freeze(Object.assign({}, resolved.descriptor.provides)),
-        payload: this._freeze(resolved.payload.wheels
-          ? { wheels: resolved.payload.wheels.map((w) => ({ filename: w.filename, format: w.format, size: w.size, sha256: w.sha256 })), imports: resolved.payload.imports.slice() }
-          : { files: this._freeze(Object.assign({}, resolved.payload.files)), imports: resolved.payload.imports.slice() }),
+        payload: this._freeze({
+          wheels: resolved.payload.wheels.map((w) => ({ filename: w.filename, format: w.format, size: w.size, sha256: w.sha256 })),
+          imports: resolved.payload.imports.slice(),
+        }),
       }));
     }
     const mcpList = [];
@@ -1161,21 +1100,13 @@ class CapabilityManager {
     const modules = [];
     for (const p of source.plugins) {
       if (p.runtime !== 'python') continue;
-      if (p.payload.wheels) {
-        const artifact = this._artifacts.get(p.id);
-        if (!artifact || artifact.sha256 !== p.payload.wheels[0].sha256) {
-          throw extensionResolutionError('plugin ' + p.id + ': wheel bytes for ' + p.payload.wheels[0].sha256 + ' are not registered');
-        }
-        modules.push(this._freeze({
-          pluginId: p.id,
-          wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256, bytes: artifact.bytes.slice() }],
-          imports: p.payload.imports.slice(),
-        }));
-        continue;
+      const artifact = this._artifacts.get(p.id);
+      if (!artifact || artifact.sha256 !== p.payload.wheels[0].sha256) {
+        throw extensionResolutionError('plugin ' + p.id + ': wheel bytes for ' + p.payload.wheels[0].sha256 + ' are not registered');
       }
       modules.push(this._freeze({
         pluginId: p.id,
-        files: Object.assign({}, p.payload.files),
+        wheels: [{ filename: artifact.filename, format: artifact.format, size: artifact.size, sha256: artifact.sha256, bytes: artifact.bytes.slice() }],
         imports: p.payload.imports.slice(),
       }));
     }
@@ -1233,8 +1164,7 @@ class CapabilityManager {
 // Runtime's own copies; see docs/EXTRACTION-PLAN.md).
 export {
   CapabilityManager, SkillSourceStore, pythonExtensionKeyOf,
-  validatePluginPayload, registerPluginRuntimeProvider,
-  pluginRuntimeProvider, unregisterPluginRuntimeProvider,
+  validatePluginPayload,
   EXTENSION_ID_PATTERN, EXTENSION_PY_MODULE_PATTERN,
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
 };

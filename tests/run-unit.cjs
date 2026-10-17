@@ -26,6 +26,8 @@ const SUITES = [
   'capability-composition.test.mjs',
   // incremental capability package registration (wheel artifacts, skill upgrade rule)
   'capability-packages.test.mjs',
+  // wheel-only plugins (D10 §6): no source-text payloads, no provider seam
+  'wheel-only-plugins.test.mjs',
   // public-entry contract surface (M3b review R1: the descriptor validators
   // and the skill-instance contract data real Product consumers read)
   'public-entry-contracts.test.mjs',

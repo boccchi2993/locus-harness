@@ -17,8 +17,7 @@
 
 import {
   CapabilityManager, SkillSourceStore,
-  validatePluginPayload, registerPluginRuntimeProvider,
-  unregisterPluginRuntimeProvider, pluginRuntimeProvider,
+  validatePluginPayload,
 } from '../src/extension-composition.js';
 import { harnessCapabilities } from '../src/index.js';
 
@@ -185,23 +184,26 @@ function newPackageManager(home, catalogs) {
   return m;
 }
 
-// A synthetic capability served through the classic files provider (the
-// pre-package resolution path) — used to prove packages are additive.
-const SYN_CATALOGS = () => ({
-  plugins: [{
-    id: 'syn-plug', version: '1', displayName: 'Syn Plug',
-    runtime: 'python', authority: 'none', provides: { pythonImports: ['syn_plug'] },
-  }],
-  skills: [], mcps: [],
-  capabilities: [{
-    id: 'syn-cap', version: '1', displayName: 'Syn Cap', description: 'synthetic files capability',
-    plugins: ['syn-plug'], skills: [], mcps: [],
-  }],
-});
-const SYN_PROVIDER = {
-  runtime: 'python',
-  async prepare(plugin) { return { files: { ['syn_' + plugin.id.replace(/[^a-z0-9]/g, '_') + '.py']: 'x = 1\n' }, imports: [] }; },
-};
+// A second package shape (D10 §6: packages are the only way a plugin
+// enters the manager) — capability syn-cap with one python plugin wheel.
+// Used to prove package registration is additive.
+const WHEEL_SYN = new Uint8Array(40).map((_, i) => (i * 13 + 1) & 0xff);
+
+async function pkgSyn() {
+  return {
+    capability: {
+      id: 'syn-cap', version: '1', displayName: 'Syn Cap', description: 'synthetic package capability',
+      plugins: ['syn-plug'], skills: [], mcps: [],
+    },
+    plugins: [{
+      id: 'syn-plug', version: '1', displayName: 'Syn Plug',
+      runtime: 'python', authority: 'none', provides: { pythonImports: ['syn_plug'] },
+    }],
+    skills: [], mcps: [],
+    sources: {},
+    artifacts: { 'syn-plug': await artifactFor(WHEEL_SYN, 'syn_plug-1.0-py3-none-any.whl') },
+  };
+}
 
 async function run() {
   // ================= CP17. capability declaration =================
@@ -219,22 +221,21 @@ async function run() {
     m1.isPackage('cap-a') === true && m1.isPackage('nope') === false);
 
   // ================= CP2. registration leaves other capabilities untouched =================
-  registerPluginRuntimeProvider('python', SYN_PROVIDER);
-  const m2 = newPackageManager(new MemoryInstanceStore(), SYN_CATALOGS());
-  check('CP2 synthetic capability enables through the files provider',
+  const m2 = newPackageManager(new MemoryInstanceStore());
+  await m2.registerPackage(await pkgSyn());
+  check('CP2 synthetic package capability enables through its registered wheel',
     await m2.enable('syn-cap') === 'ready');
   await m2.registerPackage(pkgA({ artifact: await artifactFor(WHEEL_A) }));
   check('CP2 package registration keeps the enabled capability enabled',
     m2.isEnabled('syn-cap') && m2.capabilityState('syn-cap') === 'ready'
       && m2.isPackage('cap-a') && m2.capabilityState('cap-a') === 'disabled');
-  unregisterPluginRuntimeProvider('python');
 
-  // ================= CP5. package plugins enable WITHOUT any runtime provider =================
-  check('CP5 precondition: no python runtime provider registered',
-    pluginRuntimeProvider('python') === null);
+  // ================= CP5. package plugins enable — registered wheel artifacts are the only path =================
+  // (the PluginRuntimeProvider seam this block used to contrast against is
+  // deleted; see tests/wheel-only-plugins.test.mjs for the wheel-only gate)
   const m5 = newPackageManager(new MemoryInstanceStore());
   await m5.registerPackage(pkgA({ artifact: await artifactFor(WHEEL_A) }));
-  check('CP5 enable of a package capability is ready without a provider',
+  check('CP5 enable of a package capability is ready with no other resolution path',
     await m5.enable('cap-a') === 'ready');
 
   // ================= CP3. registration rejections leave no half state =================
@@ -346,21 +347,16 @@ async function run() {
   const keyB = kB.buildTaskEnvironment().pythonExtensionKey;
   check('CP8.a same id+version with different wheel bytes yields different keys',
     keyA !== keyB && /^plug-a@1#[0-9a-f]{64}$/.test(keyA) && keyA.startsWith('plug-a@1#'));
-  registerPluginRuntimeProvider('python', SYN_PROVIDER);
-  const mF = newPackageManager(new MemoryInstanceStore(), SYN_CATALOGS());
-  await mF.enable('syn-cap');
-  check('CP8.b files-based plugin key keeps the exact old format (id@version)',
-    mF.buildTaskEnvironment().pythonExtensionKey === 'syn-plug@1');
 
-  // ================= CP9. validatePluginPayload: exactly one of files / wheels =================
+  // ================= CP9. validatePluginPayload: wheels only — source text rejected =================
   const plugProbe = plugADescriptor();
   const wheelMeta = { filename: 'plug_a-1.0-py3-none-any.whl', format: 'python-wheel', size: WHEEL_A.byteLength, sha256: await sha256hex(WHEEL_A) };
-  await throwsWith('CP9.a payload with BOTH files and wheels is rejected',
+  await throwsWith('CP9.a payload carrying files is rejected (source text unsupported)',
     () => validatePluginPayload(plugProbe, { files: { 'a.py': 'x' }, wheels: [wheelMeta], imports: [] }),
-    'ExtensionResolutionError', 'exactly one of files / wheels');
-  await throwsWith('CP9.b payload with NEITHER files nor wheels is rejected',
+    'ExtensionResolutionError', 'source-text payloads are no longer supported');
+  await throwsWith('CP9.b payload without wheels is rejected',
     () => validatePluginPayload(plugProbe, { imports: [] }),
-    'ExtensionResolutionError', 'exactly one of files / wheels');
+    'ExtensionResolutionError', 'payload must carry exactly one wheel');
   await throwsWith('CP9.c wheels carrying bytes are rejected',
     () => validatePluginPayload(plugProbe, { wheels: [Object.assign({ bytes: WHEEL_A }, wheelMeta)], imports: [] }),
     'ExtensionResolutionError', 'wheel bytes never travel');

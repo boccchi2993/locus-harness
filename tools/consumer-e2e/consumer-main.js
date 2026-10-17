@@ -8,7 +8,7 @@ import {
   createProviderSessions, getProviderAdapter, createProviderIdentity,
   projectNormalizedHistory, validateReplayPrefix,
   createApprovalController, imageInputUnavailableNotice,
-  createCapabilityManager, SkillSourceStore, registerPluginRuntimeProvider,
+  createCapabilityManager, SkillSourceStore,
   validatePluginPayload,
   pythonExtensionKeyOf, buildSystemPrompt,
   // M3b review R1 (F1): the descriptor validators + the skill-instance
@@ -389,16 +389,14 @@ const CONFIG = { dialect: 'openai', apiBase: 'https://api.example.test/v1', mode
   }
 
   // ============ H. capability composition: happy path + rejection path ============
+  // D10 §6: a plugin enters Python only as a verified wheel artifact
+  // registered with its capability package via registerPackage — the
+  // provider seam is gone from the public entry.
   {
-    registerPluginRuntimeProvider('python', {
-      async prepare(plugin) {
-        return { files: { 'mod.py': 'x = 1\n' }, imports: ['mod'] };
-      },
-    });
     const catalogs = {
-      plugins: [{ id: 'p1', version: '1', runtime: 'python', authority: 'none', provides: { pythonImports: ['mod'] } }],
+      plugins: [],
       skills: [{ id: 's1', version: '1', description: 'guide' }],
-      capabilities: [{ id: 'c1', version: '1', displayName: 'Consumer Capability', description: 'd', plugins: ['p1'], skills: ['s1'] }],
+      capabilities: [],
     };
     const sources = new SkillSourceStore();
     sources.define('s1', '1', '# guide\n');
@@ -411,20 +409,38 @@ const CONFIG = { dialect: 'openai', apiBase: 'https://api.example.test/v1', mode
       async stat(rel) { if (!mem.has(rel)) throw notFound(); return { kind: 'file' }; },
     };
     const manager = createCapabilityManager({ catalogs, sources, instances });
+    // Wheel-only (D10 §6): c1 ships p1 as a verified wheel artifact; the
+    // sha256 is computed here over the exact bytes handed to the manager.
+    const wheelBytes = new Uint8Array(48).map((_, i) => (i * 7 + 3) & 0xff);
+    const wheelDigest = await crypto.subtle.digest('SHA-256', wheelBytes);
+    const wheelSha = Array.from(new Uint8Array(wheelDigest), (b) => b.toString(16).padStart(2, '0')).join('');
+    await manager.registerPackage({
+      capability: { id: 'c1', version: '1', displayName: 'Consumer Capability', description: 'd', plugins: ['p1'], skills: ['s1'], mcps: [] },
+      plugins: [{ id: 'p1', version: '1', runtime: 'python', authority: 'none', provides: { pythonImports: ['mod'] } }],
+      skills: [{ id: 's1', version: '1', description: 'guide' }],
+      mcps: [],
+      sources: { s1: { version: '1', source: '# guide\n' } },
+      artifacts: { p1: { filename: 'p1-1.0-py3-none-any.whl', format: 'python-wheel', size: wheelBytes.byteLength, sha256: wheelSha, bytes: wheelBytes } },
+    });
     const state = await manager.enable('c1');
     const env = manager.buildTaskEnvironment();
     const prompt = buildSystemPrompt({ workspace: null, taskEnvironment: env });
     results.H1 = {
       state,
       ready: state === 'ready',
-      envKey: env.pythonExtensionKey === 'p1@1',
+      envKey: env.pythonExtensionKey === 'p1@1#' + wheelSha,
       promptCarriesIndex: prompt.includes('Consumer Capability') && prompt.includes('.skills/c1/s1.skill'),
       payloadValid: (() => {
-        const v = validatePluginPayload({ id: 'p1' }, { files: { 'mod.py': 'x = 1\n' }, imports: ['mod'] });
-        return v.files['mod.py'] === 'x = 1\n' && v.imports.join() === 'mod';
+        const v = validatePluginPayload({ id: 'p1' }, {
+          wheels: [{ filename: 'p1-1.0-py3-none-any.whl', format: 'python-wheel', size: wheelBytes.byteLength, sha256: wheelSha }],
+          imports: ['mod'],
+        });
+        return v.wheels.length === 1 && v.wheels[0].sha256 === wheelSha && !('files' in v) && v.imports.join() === 'mod';
       })(),
     };
-    // rejection: a payload with a traversal path fails loudly
+    // rejection: a source-text payload fails loudly (D10 §6 — the old
+    // traversal-path rejection rode on the now-deleted files branch; the
+    // same malformed input must still throw with the same error code)
     let rejectCode = null;
     try { validatePluginPayload({ id: 'bad' }, { files: { '../evil.py': 'x' }, imports: [] }); }
     catch (e) { rejectCode = e.code || e.name; }

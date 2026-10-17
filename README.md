@@ -48,7 +48,7 @@ The package exposes exactly one entry (`.`). Grouped exports:
   `imageInputUnavailableNotice`.
 - Capability composition core: `createCapabilityManager` / `CapabilityManager`,
   `SkillSourceStore`, `pythonExtensionKeyOf`, `validatePluginPayload`,
-  `registerPluginRuntimeProvider`, `EXTENSION_ID_PATTERN`,
+  `EXTENSION_ID_PATTERN`,
   `EXTENSION_PY_MODULE_PATTERN`, `CAPABILITY_CATALOG`, `PLUGIN_CATALOG`,
   `SKILL_CATALOG`, `MCP_CATALOG`.
 - Descriptor + skill-instance contract (added by review round 1 — real Product

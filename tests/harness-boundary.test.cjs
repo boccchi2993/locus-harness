@@ -199,7 +199,7 @@ function resolveRel(fromRel, spec) {
     'createModelCapabilityRegistry', 'createImageInputGate', 'runImageInputProbe',
     'classifyImageProviderError', 'imageInputUnavailableNotice',
     'createCapabilityManager', 'CapabilityManager', 'SkillSourceStore',
-    'pythonExtensionKeyOf', 'validatePluginPayload', 'registerPluginRuntimeProvider',
+    'pythonExtensionKeyOf', 'validatePluginPayload',
     'EXTENSION_ID_PATTERN', 'EXTENSION_PY_MODULE_PATTERN',
     'CAPABILITY_CATALOG', 'PLUGIN_CATALOG', 'SKILL_CATALOG', 'MCP_CATALOG',
     // M3b review R1 (F1): the descriptor validators and the skill-instance
