@@ -285,6 +285,79 @@ async function run() {
   check('CW12 harnessCapabilities declares contextWindowBudget',
     harnessCapabilities().capabilities.contextWindowBudget === true);
 
+  // ---------- CW13. tokenCalibration() returns a copy ----------
+  {
+    const { session } = newSession();
+    session._recordTokenSample(3000, false, { prompt_tokens: 1000 }); // ratio 3
+    session._recordTokenSample(1000, false, { prompt_tokens: 500 }); // ratio 2
+    const snapshot = session.tokenCalibration();
+    check('CW13 tokenCalibration returns the recorded samples',
+      Array.isArray(snapshot) && snapshot.length === 2 && snapshot[0] === 3 && snapshot[1] === 2,
+      JSON.stringify(snapshot));
+    snapshot.push(999999);
+    snapshot[0] = 0;
+    check('CW13b mutating the returned array does not affect the session',
+      Math.abs(session.bytesPerToken() - 2.5) <= 1e-9 && session._bytesPerTokenSamples.length === 2,
+      'ratio=' + session.bytesPerToken() + ' n=' + session._bytesPerTokenSamples.length);
+  }
+
+  // ---------- CW14. the snapshot round-trips between sessions ----------
+  {
+    const a = newSession().session;
+    a._recordTokenSample(3000, false, { prompt_tokens: 1000 }); // ratio 3
+    a._recordTokenSample(4000, false, { prompt_tokens: 2000 }); // ratio 2
+    const b = newSession().session;
+    b.restoreTokenCalibration(a.tokenCalibration());
+    check('CW14 the restored session matches bytesPerToken',
+      b.bytesPerToken() === a.bytesPerToken(), 'b=' + b.bytesPerToken() + ' a=' + a.bytesPerToken());
+    a.setContextWindow(100000);
+    b.setContextWindow(100000);
+    check('CW14b the restored session matches effectiveRequestBudgetBytes',
+      b.effectiveRequestBudgetBytes() === a.effectiveRequestBudgetBytes(),
+      'b=' + b.effectiveRequestBudgetBytes() + ' a=' + a.effectiveRequestBudgetBytes());
+  }
+
+  // ---------- CW15. restoreTokenCalibration validates its input ----------
+  {
+    const { session } = newSession();
+    session._recordTokenSample(3000, false, { prompt_tokens: 1000 }); // ratio 3
+    const badInputs = [
+      'not an array', 3, undefined, // non-arrays
+      [1, 1, 1, 1, 1, 1], // six samples > the 5-sample window
+      [0], [-1], [NaN], [Infinity], [1000], ['2'],
+    ];
+    let thrown = 0;
+    for (const bad of badInputs) {
+      try { session.restoreTokenCalibration(bad); } catch (e) { thrown++; }
+    }
+    check('CW15 invalid samples throw', thrown === badInputs.length,
+      thrown + '/' + badInputs.length + ' threw');
+    check('CW15b the samples survive a failed restore',
+      session._bytesPerTokenSamples.length === 1 && Math.abs(session.bytesPerToken() - 3) <= 1e-9,
+      'ratio=' + session.bytesPerToken() + ' n=' + session._bytesPerTokenSamples.length);
+    session.restoreTokenCalibration([]);
+    check('CW15c an empty snapshot is legal and returns to the default',
+      session.bytesPerToken() === 2 && session._bytesPerTokenSamples.length === 0,
+      'ratio=' + session.bytesPerToken());
+  }
+
+  // ---------- CW16. recording continues after a restore ----------
+  {
+    const { session } = newSession();
+    session.restoreTokenCalibration([1, 2, 3, 4, 5]);
+    check('CW16 a five-sample snapshot restores in full',
+      session._bytesPerTokenSamples.length === 5);
+    session._recordTokenSample(6000, false, { prompt_tokens: 1000 }); // ratio 6
+    check('CW16b the oldest sample is evicted, not grown past 5',
+      session._bytesPerTokenSamples.length === 5
+      && session._bytesPerTokenSamples[0] === 2 && session._bytesPerTokenSamples[4] === 6,
+      JSON.stringify(session._bytesPerTokenSamples));
+  }
+
+  // ---------- CW17. the capability declaration names tokenCalibrationSnapshot ----------
+  check('CW17 harnessCapabilities declares tokenCalibrationSnapshot',
+    harnessCapabilities().capabilities.tokenCalibrationSnapshot === true);
+
   console.log('---');
   console.log('context-window.test.mjs: ' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

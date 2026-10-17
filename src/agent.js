@@ -630,6 +630,19 @@ class AgentSession {
   // the provider endpoint, model or dialect changes.
   resetTokenCalibration() { this._bytesPerTokenSamples = []; }
 
+  // Calibration snapshot for Product persistence (the Product keys it by
+  // provider endpoint + model + dialect and restores it only for the SAME
+  // identity — D5: measured per provider, never inferred).
+  tokenCalibration() { return this._bytesPerTokenSamples.slice(); }
+
+  restoreTokenCalibration(samples) {
+    if (!Array.isArray(samples) || samples.length > TOKEN_CALIBRATION_SAMPLES
+      || samples.some((x) => !(Number.isFinite(x) && x > 0 && x < 1000))) {
+      throw new Error('AgentSession: invalid token calibration samples');
+    }
+    this._bytesPerTokenSamples = samples.slice();
+  }
+
   bytesPerToken() {
     const s = this._bytesPerTokenSamples;
     if (!s.length) return DEFAULT_BYTES_PER_TOKEN;

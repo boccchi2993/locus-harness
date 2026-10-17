@@ -225,6 +225,7 @@ export function harnessCapabilities() {
   declaration.capabilities.requestBudget = true;        // setRequestBudget / minimumRequestBytes / low-water trim + elision
   declaration.capabilities.contextWindowBudget = true;  // setContextWindow / usage-calibrated bytes-per-token / min(transport, context)
   declaration.capabilities.capabilityPackages = true;   // registerPackage / unregisterPackage / wheel payload / skill upgrade rule
+  declaration.capabilities.tokenCalibrationSnapshot = true; // tokenCalibration / restoreTokenCalibration
 
   return deepFreezeDeclaration(declaration);
 }
