@@ -25,8 +25,7 @@
 
 import {
   CapabilityManager, SkillSourceStore, pythonExtensionKeyOf,
-  validatePluginPayload, registerPluginRuntimeProvider,
-  unregisterPluginRuntimeProvider,
+  validatePluginPayload,
   EXTENSION_ID_PATTERN, EXTENSION_PY_MODULE_PATTERN,
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
   validatePluginDescriptor, validateSkillDescriptor,
@@ -125,21 +124,14 @@ async function throwsWith(name, fn, namePart, msgPart) {
 // ---- synthetic TEST-ONLY catalog (never part of production) ----
 // The skill's default Markdown source lives in a real fixture file and is
 // injected into the SkillSourceStore — NEVER inline on the descriptor.
+// D10 §6: plugins enter the manager ONLY through registerPackage with a
+// verified wheel artifact, so the plugin-bearing capabilities
+// (synthetic-capability / cap-a / cap-b) arrive as packages; the
+// constructor catalogs keep exactly the capabilities that need no plugin.
 const SYNTH_SKILL_BODY = read('tests/fixtures/skills/synthetic-skill/SKILL.md');
 
 const SYNTH_CATALOGS = () => ({
-  plugins: [
-    {
-      id: 'synthetic-python-plugin', version: '1', displayName: 'Synthetic Python Plugin',
-      runtime: 'python', authority: 'none',
-      provides: { pythonImports: ['locus_test_plugin'] },
-    },
-    {
-      id: 'shared-plugin', version: '2', displayName: 'Shared Plugin',
-      runtime: 'python', authority: 'none',
-      provides: { pythonImports: [] },
-    },
-  ],
+  plugins: [],
   skills: [
     { id: 'synthetic-skill', version: '1', displayName: 'Synthetic Skill', description: 'How to use the synthetic capability.' },
     { id: 'shared-skill', version: '1', description: 'Shared guidance.' },
@@ -149,26 +141,36 @@ const SYNTH_CATALOGS = () => ({
   ],
   capabilities: [
     {
+      id: 'synthetic-mcp-capability', version: '1', displayName: 'Synthetic MCP Capability',
+      description: 'Requires an external authority.',
+      plugins: [], skills: ['synthetic-skill'], mcps: ['synthetic-service'],
+    },
+  ],
+});
+
+// Catalogs for the NO-ARTIFACT error case (M1–M3, S11): the capability and
+// its plugin descriptor exist, but no wheel artifact is registered —
+// enable() must fail loudly with the wheel-only resolution error.
+const ERR_CATALOGS = () => ({
+  plugins: [
+    {
+      id: 'synthetic-python-plugin', version: '1', displayName: 'Synthetic Python Plugin',
+      runtime: 'python', authority: 'none',
+      provides: { pythonImports: ['locus_test_plugin'] },
+    },
+  ],
+  skills: [
+    { id: 'synthetic-skill', version: '1', displayName: 'Synthetic Skill', description: 'How to use the synthetic capability.' },
+    { id: 'shared-skill', version: '1', description: 'Shared guidance.' },
+  ],
+  mcps: [],
+  capabilities: [
+    {
       id: 'synthetic-capability', version: '1', displayName: 'Synthetic Capability',
       description: 'TEST ONLY composition proof.',
       plugins: ['synthetic-python-plugin'],
       skills: ['synthetic-skill'],
       mcps: [],
-    },
-    {
-      id: 'cap-a', version: '1', displayName: 'Capability A',
-      description: 'Shares plugin X and the skill definition with B.',
-      plugins: ['shared-plugin'], skills: ['shared-skill'], mcps: [],
-    },
-    {
-      id: 'cap-b', version: '1', displayName: 'Capability B',
-      description: 'Also shares plugin X and the skill definition.',
-      plugins: ['shared-plugin'], skills: ['shared-skill'], mcps: [],
-    },
-    {
-      id: 'synthetic-mcp-capability', version: '1', displayName: 'Synthetic MCP Capability',
-      description: 'Requires an external authority.',
-      plugins: [], skills: ['synthetic-skill'], mcps: ['synthetic-service'],
     },
   ],
 });
@@ -180,33 +182,97 @@ function synthSources() {
   return s;
 }
 
+// ---- wheel package fixtures (D10 §6) ----
+async function sha256hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const WHEEL_SYN = new Uint8Array(48).map((_, i) => (i * 7 + 3) & 0xff);
+const WHEEL_SHARED = new Uint8Array(48).map((_, i) => (i * 11 + 5) & 0xff);
+
+async function wheelArtifact(bytes, filename) {
+  return {
+    filename: filename || 'locus_test_plugin-1.0.0-py3-none-any.whl',
+    format: 'python-wheel',
+    size: bytes.byteLength,
+    sha256: await sha256hex(bytes),
+    bytes: bytes,
+  };
+}
+
+// The synthetic-capability package: one python plugin (verified wheel) and
+// the synthetic skill with its fixture source.
+async function synthPkg() {
+  return {
+    capability: {
+      id: 'synthetic-capability', version: '1', displayName: 'Synthetic Capability',
+      description: 'TEST ONLY composition proof.',
+      plugins: ['synthetic-python-plugin'],
+      skills: ['synthetic-skill'],
+      mcps: [],
+    },
+    plugins: [
+      {
+        id: 'synthetic-python-plugin', version: '1', displayName: 'Synthetic Python Plugin',
+        runtime: 'python', authority: 'none',
+        provides: { pythonImports: ['locus_test_plugin'] },
+      },
+    ],
+    skills: [
+      { id: 'synthetic-skill', version: '1', displayName: 'Synthetic Skill', description: 'How to use the synthetic capability.' },
+    ],
+    mcps: [],
+    sources: { 'synthetic-skill': { version: '1', source: SYNTH_SKILL_BODY } },
+    artifacts: { 'synthetic-python-plugin': await wheelArtifact(WHEEL_SYN) },
+  };
+}
+
+// cap-a / cap-b share the SAME plugin descriptor + wheel bytes and the
+// SAME skill source, so both co-register (shared-component semantics).
+async function sharedPkg(id, description) {
+  return {
+    capability: {
+      id: id, version: '1', displayName: id === 'cap-a' ? 'Capability A' : 'Capability B',
+      description: description,
+      plugins: ['shared-plugin'], skills: ['shared-skill'], mcps: [],
+    },
+    plugins: [
+      {
+        id: 'shared-plugin', version: '2', displayName: 'Shared Plugin',
+        runtime: 'python', authority: 'none',
+        provides: { pythonImports: [] },
+      },
+    ],
+    skills: [
+      { id: 'shared-skill', version: '1', description: 'Shared guidance.' },
+    ],
+    mcps: [],
+    sources: { 'shared-skill': { version: '1', source: '# shared\n' } },
+    artifacts: { 'shared-plugin': await wheelArtifact(WHEEL_SHARED, 'shared_plugin-2.0.0-py3-none-any.whl') },
+  };
+}
+
 // One manager = one fresh memory store + source store, so lifecycle tests
 // never observe each other's files. The store IS the home view (the
 // manager sees the narrow port; assertions read the same files through
 // the observation API, exactly as they did through the product storage).
-function newManager(catalogs, opts) {
+// The plugin-bearing capabilities are registered as wheel packages
+// (D10 §6); opts.noPackages keeps a manager package-free (the ERR_CATALOGS
+// error case and the empty production manager).
+async function newManager(catalogs, opts) {
   const o = opts || {};
   const home = o.home || new MemoryInstanceStore();
   const sources = o.sources === undefined ? synthSources() : o.sources;
   const instances = o.instances === undefined ? home : o.instances;
   const m = new CapabilityManager({ catalogs: catalogs || SYNTH_CATALOGS(), sources, instances });
   m._testHome = home;
+  if (!o.noPackages) {
+    await m.registerPackage(await synthPkg());
+    await m.registerPackage(await sharedPkg('cap-a', 'Shares plugin X and the skill definition with B.'));
+    await m.registerPackage(await sharedPkg('cap-b', 'Also shares plugin X and the skill definition.'));
+  }
   return m;
-}
-
-function synthProvider() {
-  return {
-    runtime: 'python',
-    async prepare(plugin) {
-      if (plugin.id === 'synthetic-python-plugin') {
-        return {
-          files: { 'locus_test_plugin.py': 'def answer():\n    return 42\n' },
-          imports: ['locus_test_plugin'],
-        };
-      }
-      return { files: { ['shared_' + plugin.id.replace(/[^a-z0-9]/g, '_') + '.py']: 'x = 1\n' }, imports: [] };
-    },
-  };
 }
 
 async function run() {
@@ -216,7 +282,7 @@ async function run() {
   check('P3 production skill catalog is empty', SKILL_CATALOG.length === 0);
   check('P4 production mcp catalog is empty', MCP_CATALOG.length === 0);
   check('P5 production catalogs are frozen', Object.isFrozen(CAPABILITY_CATALOG) && Object.isFrozen(PLUGIN_CATALOG));
-  const prod = newManager({});
+  const prod = await newManager({}, { noPackages: true });
   check('P6 empty production manager lists nothing', prod.listCapabilities().length === 0);
   check('P7 empty environment has no python key', prod.buildTaskEnvironment().pythonExtensionKey === null);
   check('P8 empty environment mounts nothing (pure specs — the provider adapter is Product-side)',
@@ -312,22 +378,23 @@ async function run() {
   })());
 
   // ================= manager lifecycle =================
-  // NOTE: the "no provider" case runs BEFORE any provider registration.
-  const bare = newManager();
+  // NOTE: the no-artifact case runs on a package-free manager — the
+  // constructor catalogs declare the plugin but register no wheel
+  // artifact for it (D10 §6: plugins install only from packages).
+  const bare = await newManager(ERR_CATALOGS(), { noPackages: true });
   const bareState = await bare.enable('synthetic-capability');
-  check('M1 python plugin without runtime provider -> capability state error', bareState === 'error', bareState);
-  check('M2 error capability names the missing provider', /no runtime provider registered for "python"/.test(bare.listCapabilities().find((c) => c.id === 'synthetic-capability').error || ''));
+  check('M1 python plugin without a registered wheel artifact -> capability state error', bareState === 'error', bareState);
+  check('M2 error capability names the missing wheel artifact', /no verified wheel artifact is registered/.test(bare.listCapabilities().find((c) => c.id === 'synthetic-capability').error || ''));
   const bareEnv = bare.buildTaskEnvironment();
   const bareCap = bareEnv.capabilities.find((c) => c.id === 'synthetic-capability');
   check('M3 error capability contributes no components to the environment',
     bareCap && bareCap.state === 'error' && bareCap.pluginIds.length === 0 && bareCap.skillIds.length === 0
     && bareEnv.plugins.length === 0 && bareEnv.skills.length === 0);
 
-  registerPluginRuntimeProvider('python', synthProvider());
-  const m4 = newManager();
-  check('M4 provider (re-)registration enables resolution', await m4.enable('synthetic-capability') === 'ready');
+  const m4 = await newManager();
+  check('M4 registering the wheel package enables resolution', await m4.enable('synthetic-capability') === 'ready');
 
-  const mgr = newManager();
+  const mgr = await newManager();
   const list0 = mgr.listCapabilities();
   check('M5 all catalog capabilities start disabled', list0.length === 4 && list0.every((c) => c.state === 'disabled' && !c.enabled));
   check('M6 includes counts come from the descriptor refs', (() => {
@@ -353,8 +420,10 @@ async function run() {
   check('M9 environment carries the capability (ready)', env.capabilities.length === 1 && env.capabilities[0].state === 'ready');
   check('M10 environment carries the plugin descriptor (authority none)',
     env.plugins.length === 1 && env.plugins[0].id === 'synthetic-python-plugin' && env.plugins[0].authority === 'none');
-  check('M11 environment carries the prepared payload',
-    env.plugins[0].payload.files['locus_test_plugin.py'].includes('return 42')
+  check('M11 environment carries the prepared payload (wheel metadata + imports)',
+    env.plugins[0].payload.wheels.length === 1
+    && env.plugins[0].payload.wheels[0].filename === 'locus_test_plugin-1.0.0-py3-none-any.whl'
+    && env.plugins[0].payload.wheels[0].sha256 === await sha256hex(WHEEL_SYN)
     && env.plugins[0].payload.imports.join() === 'locus_test_plugin');
   check('M12 environment carries the skill INSTANCE (metadata + derived path, never a body)',
     env.skills.length === 1
@@ -364,13 +433,13 @@ async function run() {
     && env.skills[0].present === true
     && !('body' in env.skills[0]) && !('content' in env.skills[0]) && !('source' in env.skills[0]));
   check('M13 environment carries the instance path per capability', env.capabilities[0].skillPaths.join() === env.skills[0].path);
-  check('M14 pythonExtensionKey identifies the payload set', env.pythonExtensionKey === 'synthetic-python-plugin@1');
+  check('M14 pythonExtensionKey identifies the payload set', env.pythonExtensionKey === 'synthetic-python-plugin@1#' + await sha256hex(WHEEL_SYN));
 
   // ---- frozen TaskEnvironment ----
   const envFrozen = Object.isFrozen(env) && Object.isFrozen(env.capabilities) && Object.isFrozen(env.plugins)
     && Object.isFrozen(env.skills) && Object.isFrozen(env.mcps) && Object.isFrozen(env.capabilities[0])
     && Object.isFrozen(env.plugins[0]) && Object.isFrozen(env.plugins[0].payload)
-    && Object.isFrozen(env.plugins[0].payload.files) && Object.isFrozen(env.skills[0]);
+    && Object.isFrozen(env.plugins[0].payload.wheels) && Object.isFrozen(env.skills[0]);
   check('M15 TaskEnvironment is deeply frozen', envFrozen);
   const mutationOK = await (async () => {
     'use strict';
@@ -428,7 +497,7 @@ async function run() {
     && (await mgr._testHome.exists('.skills/synthetic-capability/synthetic-skill.skill')));
 
   // ---- MCP requirement semantics ----
-  const mmgr = newManager();
+  const mmgr = await newManager();
   await mmgr.enable('synthetic-mcp-capability');
   check('M26 unconnected MCP requirement -> needs-connection (never ready)',
     mmgr.capabilityState('synthetic-mcp-capability') === 'needs-connection');
@@ -443,13 +512,13 @@ async function run() {
   check('M30 connected status appears only in the NEXT snapshot',
     mEnv2.mcps[0].state === 'connected' && mEnv1.mcps[0].state === 'needs-connection');
   await throwsWith('M31 invalid MCP state is rejected', () => mmgr.setMcpState('synthetic-service', 'authorized'), 'invalid MCP state');
-  const umgr = newManager();
+  const umgr = await newManager();
   await umgr.enable('synthetic-mcp-capability');
   umgr.setMcpState('synthetic-service', 'unavailable');
   check('M32 unavailable authority also keeps needs-connection', umgr.capabilityState('synthetic-mcp-capability') === 'needs-connection');
 
   // ---- catalog replacement (test/e2e injection path) ----
-  const rmgr = newManager();
+  const rmgr = await newManager();
   await rmgr.enable('synthetic-capability');
   rmgr.replaceCatalogs({ capabilities: [] });
   check('M33 replaceCatalogs resets enabled-state', rmgr.listCapabilities().length === 0 && rmgr.buildTaskEnvironment().capabilities.length === 0);
@@ -462,10 +531,10 @@ async function run() {
   }, 'unknown plugin');
 
   // ================= system prompt =================
-  const readyMgr = newManager();
+  const readyMgr = await newManager();
   await readyMgr.enable('synthetic-capability');
   const readyEnv = readyMgr.buildTaskEnvironment();
-  const pMgr = newManager();
+  const pMgr = await newManager();
   await pMgr.enable('synthetic-capability');
   await pMgr.enable('synthetic-mcp-capability');
   const pEnv = pMgr.buildTaskEnvironment();
@@ -496,12 +565,10 @@ async function run() {
     && !buildSystemPrompt({ workspace: null, taskEnvironment: presentEnv }).includes('synthetic-skill.skill')
     && buildSystemPrompt({ workspace: null, taskEnvironment: presentEnv }).includes('Synthetic Capability'));
   // error-state capability stays out of the prompt (S11 below)
-  const errMgr = newManager();
-  unregisterPluginRuntimeProvider('python');
+  const errMgr = await newManager(ERR_CATALOGS(), { noPackages: true });
   await errMgr.enable('synthetic-capability');
   const errPrompt = buildSystemPrompt({ workspace: null, taskEnvironment: errMgr.buildTaskEnvironment() });
   check('S11 error-state capability adds no prompt section', !errPrompt.includes('## Capabilities'));
-  registerPluginRuntimeProvider('python', synthProvider());
 
   // budget integration: the index is inside the counted system prompt
   const session = new AgentSession({
@@ -522,20 +589,22 @@ async function run() {
     specProbe.every((s) => !('provider' in s) && typeof s.path === 'string' && typeof s.files === 'object'));
 
   // ================= python extension payload/key =================
-  const payload = newManager().pythonExtensionPayload(vEnv);
+  const payload = (await newManager()).pythonExtensionPayload(vEnv);
   check('K1 payload key matches the environment', payload.key === vEnv.pythonExtensionKey);
-  check('K2 payload carries files + imports', payload.modules.length === 1
+  check('K2 payload carries the wheel bytes + imports', payload.modules.length === 1
     && payload.modules[0].pluginId === 'synthetic-python-plugin'
-    && payload.modules[0].files['locus_test_plugin.py'].includes('return 42')
+    && payload.modules[0].wheels[0].sha256 === await sha256hex(WHEEL_SYN)
+    && payload.modules[0].wheels[0].bytes.byteLength === WHEEL_SYN.byteLength
     && payload.modules[0].imports.join() === 'locus_test_plugin');
   check('K3 payload is frozen', Object.isFrozen(payload) && Object.isFrozen(payload.modules) && Object.isFrozen(payload.modules[0]));
   check('K4 key is null without python plugins', prod.buildTaskEnvironment().pythonExtensionKey === null);
   check('K5 key changes with plugin version', (async () => {
-    const c = SYNTH_CATALOGS();
-    c.plugins[0].version = '2';
-    const m = newManager(c);
+    const m = await newManager(SYNTH_CATALOGS(), { noPackages: true });
+    const p = await synthPkg();
+    p.plugins[0].version = '2';
+    await m.registerPackage(p);
     await m.enable('synthetic-capability');
-    return m.buildTaskEnvironment().pythonExtensionKey === 'synthetic-python-plugin@2';
+    return m.buildTaskEnvironment().pythonExtensionKey === 'synthetic-python-plugin@2#' + await sha256hex(WHEEL_SYN);
   })());
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');

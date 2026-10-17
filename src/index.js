@@ -84,7 +84,7 @@ export function createCapabilityManager(opts) {
 // ---------- capability composition core ----------
 export {
   SkillSourceStore, pythonExtensionKeyOf,
-  validatePluginPayload, registerPluginRuntimeProvider,
+  validatePluginPayload,
   EXTENSION_ID_PATTERN, EXTENSION_PY_MODULE_PATTERN,
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
 } from './extension-composition.js';
@@ -226,6 +226,7 @@ export function harnessCapabilities() {
   declaration.capabilities.contextWindowBudget = true;  // setContextWindow / usage-calibrated bytes-per-token / min(transport, context)
   declaration.capabilities.capabilityPackages = true;   // registerPackage / unregisterPackage / wheel payload / skill upgrade rule
   declaration.capabilities.tokenCalibrationSnapshot = true; // tokenCalibration / restoreTokenCalibration
+  declaration.capabilities.wheelOnlyPlugins = true;     // D10: no source-text plugin payloads, no PluginRuntimeProvider seam
 
   return deepFreezeDeclaration(declaration);
 }
