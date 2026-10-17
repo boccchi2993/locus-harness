@@ -139,7 +139,7 @@ async function main() {
     check('H capability composition happy path (enable → ready env → prompt index → payload valid)',
       r.H1.ready === true && r.H1.envKey === true && r.H1.promptCarriesIndex === true && r.H1.payloadValid === true,
       JSON.stringify(r.H1));
-    check('H2 capability composition rejection path (traversal payload fails loudly)',
+    check('H2 capability composition rejection path (source-text payload fails loudly)',
       r.H2.rejectCode === 'extension_resolution_failed', JSON.stringify(r.H2));
 
     // ---- K (M3b review R1, F1) ----
