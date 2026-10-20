@@ -110,6 +110,20 @@ async function throwsWith(name, fn, needle) {
     }
   }
 
+  // ---------- CC3b. trailing-dot host names are rejected ----------
+  // WHATWG URLs keep a trailing DNS root hint verbatim (url.origin
+  // round-trips), so these slipped past every earlier rule: not
+  // "localhost", dot-less check defeated by the extra dot. Bindings
+  // compare origins EXACTLY, so a trailing-dot twin would fork a second
+  // binding — rejected even for otherwise-public names.
+  {
+    for (const origin of ['https://localhost.', 'https://foo.local.', 'https://a.localhost.', 'https://api.deepseek.com.']) {
+      await throwsWith('CC3b trailing-dot origin ' + origin + ' rejected with the field named',
+        () => validateCapabilityDescriptor(cap('cap-a', [credential({ origin })])),
+        'origin');
+    }
+  }
+
   // ---------- CC4. illegal pathPrefix values ----------
   {
     for (const pathPrefix of ['repos', '/repos', '/a/../b', '//', '/a//b', '/a%2Fb', '/a?b', '/a#b']) {
@@ -289,6 +303,47 @@ async function throwsWith(name, fn, needle) {
       credentialBindingChanged(oldC, Object.assign({}, oldC, { scheme: 'Bearer' })) === true);
     check('CC12 label/description edits alone are NOT a binding change',
       credentialBindingChanged(oldC, Object.assign({}, oldC, { label: 'Renamed', description: 'new words' })) === false);
+  }
+
+  // ---------- CC13. listCapabilities carries credentials in every state ----------
+  {
+    const mgr = new CapabilityManager({
+      catalogs: { capabilities: [cap('cap-a', [credential({ name: 'TOKEN_A', description: 'repo scope', scheme: 'Bearer', header: 'X-API-KEY' })]), cap('cap-b')] },
+    });
+    // Disabled (never enabled): the binding is visible with the default
+    // connection state — the settings UI renders Connect on the card.
+    const a0 = mgr.listCapabilities().find((c) => c.id === 'cap-a');
+    const b0 = mgr.listCapabilities().find((c) => c.id === 'cap-b');
+    check('CC13 disabled capability lists credentials with state needs-connection',
+      Array.isArray(a0.credentials) && a0.credentials.length === 1
+      && JSON.stringify(Object.keys(a0.credentials[0])) === JSON.stringify(
+        ['name', 'label', 'description', 'origin', 'pathPrefix', 'header', 'scheme', 'state'])
+      && a0.credentials[0].name === 'TOKEN_A'
+      && a0.credentials[0].description === 'repo scope'
+      && a0.credentials[0].origin === 'https://api.github.com'
+      && a0.credentials[0].header === 'x-api-key'
+      && a0.credentials[0].scheme === 'Bearer'
+      && a0.credentials[0].state === 'needs-connection');
+    check('CC13 no-credential capability lists an empty credentials array',
+      Array.isArray(b0.credentials) && b0.credentials.length === 0);
+    // The pre-C3 listCapabilities fields, verbatim and in order, followed
+    // by exactly ONE new field: credentials.
+    check('CC13 existing listCapabilities fields unchanged (pinned key order + credentials)',
+      JSON.stringify(Object.keys(a0)) === JSON.stringify([
+        'id', 'version', 'displayName', 'description', 'state', 'error',
+        'enabled', 'includes', 'plugins', 'skills', 'mcps', 'credentials',
+      ]), JSON.stringify(Object.keys(a0)));
+    // Credential state is registration-scoped: a state change is visible
+    // in listCapabilities with the capability still disabled.
+    mgr.setCredentialState('TOKEN_A', 'connected');
+    check('CC13 listCapabilities reflects a state change while disabled',
+      mgr.listCapabilities().find((c) => c.id === 'cap-a').credentials[0].state === 'connected');
+    // After enable, the list view and the frozen snapshot agree byte for byte.
+    await mgr.enable('cap-a');
+    const listed = mgr.listCapabilities().find((c) => c.id === 'cap-a');
+    const snapshot = mgr.buildTaskEnvironment().capabilities.find((c) => c.id === 'cap-a');
+    check('CC13 after enable listCapabilities credentials match the snapshot',
+      JSON.stringify(listed.credentials) === JSON.stringify(snapshot.credentials));
   }
 
   console.log('---');

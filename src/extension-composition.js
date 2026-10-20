@@ -385,7 +385,11 @@ function validateCredentialBinding(raw, capabilityId, index) {
   const isIPv4 = /^[0-9.]+$/.test(host) && host.indexOf('.') !== -1;
   const isIPv6 = host.charAt(0) === '[' || host.indexOf(':') !== -1;
   const forbiddenSuffix = CREDENTIAL_FORBIDDEN_HOST_SUFFIXES.some((s) => host.endsWith(s));
-  if (isIPv4 || isIPv6 || host === 'localhost' || forbiddenSuffix || host.indexOf('.') === -1) {
+  // A trailing dot round-trips through url.origin verbatim (WHATWG keeps
+  // the DNS root hint), but bindings compare origins EXACTLY — accepting
+  // "https://api.example.com." would fork a second binding beside the
+  // dot-less one. Rejected even for otherwise-public names.
+  if (isIPv4 || isIPv6 || host === 'localhost' || host.endsWith('.') || forbiddenSuffix || host.indexOf('.') === -1) {
     throw extensionDescriptorError(at + ': "origin" host ' + JSON.stringify(host)
       + ' is not a public DNS name (credentials are sent only to public hosts)');
   }
@@ -675,6 +679,20 @@ class CapabilityManager {
           id: id,
           displayName: this._mcpDisplayName(id),
           state: this._mcpState(id),
+        })),
+        // C3: credential BINDINGS are catalog facts visible in EVERY
+        // state — the settings UI renders credentials + Connect on
+        // disabled and failed capabilities too. Fresh objects each call
+        // (same shape as the TaskEnvironment snapshot entries).
+        credentials: cap.credentials.map((c) => ({
+          name: c.name,
+          label: c.label,
+          description: c.description,
+          origin: c.origin,
+          pathPrefix: c.pathPrefix,
+          header: c.header,
+          scheme: c.scheme,
+          state: this._credentialStates.get(c.name) || CREDENTIAL_DEFAULT_STATE,
         })),
       });
     }
