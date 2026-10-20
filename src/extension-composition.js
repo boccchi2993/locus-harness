@@ -328,6 +328,99 @@ function validateMcpDescriptor(raw) {
   };
 }
 
+// ---------- credential binding descriptor (C3) ----------
+// A credential BINDING is routing metadata only: WHAT the task may name
+// (name / label / description) and WHERE an authorized bearer string may
+// be sent (origin / pathPrefix / header / scheme). It never carries a
+// secret value — the value itself stays in the Product-side credential
+// store, outside the TaskEnvironment entirely.
+const CREDENTIAL_NAME_PATTERN = /^[A-Z][A-Z0-9_]{1,63}$/;
+const CREDENTIAL_HEADER_PATTERN = /^[A-Za-z0-9-]+$/;
+// Host names that can never receive credentials. Stricter than the
+// relay's SSRF classifier ON PURPOSE: credentials only ever travel to
+// public DNS names, so loopback names and the private DNS suffixes of
+// home/office networks are rejected at descriptor validation.
+const CREDENTIAL_FORBIDDEN_HOST_SUFFIXES = ['.localhost', '.local', '.internal', '.lan', '.home.arpa'];
+// Credential connection state vocabulary (C3 §3.2). Default is
+// needs-connection: a registered credential binding is not a connection.
+const CREDENTIAL_STATES = Object.freeze(['connected', 'needs-connection', 'needs-reconfirm']);
+const CREDENTIAL_DEFAULT_STATE = 'needs-connection';
+const CREDENTIAL_FIELDS = Object.freeze(['name', 'label', 'description', 'origin', 'pathPrefix', 'header', 'scheme']);
+
+// Validate + normalize ONE credential binding of a capability descriptor.
+// Errors name the capability id, the credential index and the field.
+function validateCredentialBinding(raw, capabilityId, index) {
+  const at = 'capability ' + capabilityId + ': credentials[' + index + ']';
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw extensionDescriptorError(at + ' must be an object');
+  }
+  for (const key of Object.keys(raw)) {
+    if (!CREDENTIAL_FIELDS.includes(key)) {
+      throw extensionDescriptorError(at + ': unknown credential field "' + key + '"');
+    }
+  }
+  const name = raw.name;
+  if (typeof name !== 'string' || !CREDENTIAL_NAME_PATTERN.test(name)) {
+    throw extensionDescriptorError(at + ': "name" must match ' + CREDENTIAL_NAME_PATTERN + ', got '
+      + JSON.stringify(name === undefined ? null : name));
+  }
+  if (typeof raw.label !== 'string' || !raw.label.trim()) {
+    throw extensionDescriptorError(at + ': "label" must be a non-empty string, got '
+      + JSON.stringify(raw.label === undefined ? null : raw.label));
+  }
+  if (raw.description !== undefined && raw.description !== null && typeof raw.description !== 'string') {
+    throw extensionDescriptorError(at + ': "description" must be a string when present, got '
+      + JSON.stringify(raw.description));
+  }
+  // origin: an https URL string that is EXACTLY an origin — the
+  // url.origin round-trip rejects any path, query, fragment, userinfo and
+  // non-default port — pointing at a public DNS host name.
+  let url = null;
+  try { url = new URL(raw.origin); } catch (e) { url = null; }
+  if (!url || url.protocol !== 'https:' || url.origin !== raw.origin) {
+    throw extensionDescriptorError(at + ': "origin" must be an https origin string (no path, query, fragment or userinfo), got '
+      + JSON.stringify(raw.origin === undefined ? null : raw.origin));
+  }
+  const host = url.hostname;
+  const isIPv4 = /^[0-9.]+$/.test(host) && host.indexOf('.') !== -1;
+  const isIPv6 = host.charAt(0) === '[' || host.indexOf(':') !== -1;
+  const forbiddenSuffix = CREDENTIAL_FORBIDDEN_HOST_SUFFIXES.some((s) => host.endsWith(s));
+  if (isIPv4 || isIPv6 || host === 'localhost' || forbiddenSuffix || host.indexOf('.') === -1) {
+    throw extensionDescriptorError(at + ': "origin" host ' + JSON.stringify(host)
+      + ' is not a public DNS name (credentials are sent only to public hosts)');
+  }
+  const pathPrefix = raw.pathPrefix;
+  if (typeof pathPrefix !== 'string' || !pathPrefix.startsWith('/') || !pathPrefix.endsWith('/')
+    || pathPrefix.includes('..') || pathPrefix.includes('//')
+    || pathPrefix.includes('%') || pathPrefix.includes('?') || pathPrefix.includes('#')) {
+    throw extensionDescriptorError(at + ': "pathPrefix" must start and end with "/" and contain none of "..", "//", "%", "?", "#", got '
+      + JSON.stringify(pathPrefix === undefined ? null : pathPrefix));
+  }
+  const header = raw.header;
+  const headerLower = typeof header === 'string' ? header.toLowerCase() : null;
+  const headerOk = headerLower !== null && headerLower !== ''
+    && (headerLower === 'authorization' || headerLower === 'x-api-key'
+      || (headerLower.startsWith('x-') && CREDENTIAL_HEADER_PATTERN.test(header)
+        && !headerLower.startsWith('x-forwarded-') && headerLower !== 'x-real-ip'));
+  if (!headerOk) {
+    throw extensionDescriptorError(at + ': "header" must be "authorization", "x-api-key" or a custom "x-" name of [A-Za-z0-9-] (never "x-forwarded-*" or "x-real-ip"), got '
+      + JSON.stringify(header === undefined ? null : header));
+  }
+  if (raw.scheme !== undefined && raw.scheme !== 'Bearer') {
+    throw extensionDescriptorError(at + ': "scheme" (when present) must be exactly "Bearer", got '
+      + JSON.stringify(raw.scheme));
+  }
+  return Object.freeze({
+    name: name,
+    label: raw.label,
+    description: typeof raw.description === 'string' ? raw.description : '',
+    origin: raw.origin,
+    pathPrefix: pathPrefix,
+    header: headerLower,
+    scheme: raw.scheme === undefined ? null : raw.scheme,
+  });
+}
+
 // ---------- Capability descriptor ----------
 function validateCapabilityDescriptor(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -337,6 +430,21 @@ function validateCapabilityDescriptor(raw) {
   extensionRequireString(raw.version, 'version', 'capability ' + id);
   const displayName = extensionRequireString(raw.displayName, 'displayName', 'capability ' + id);
   const description = extensionRequireString(raw.description, 'description', 'capability ' + id);
+  let credentialsRaw = raw.credentials;
+  if (credentialsRaw === undefined || credentialsRaw === null) credentialsRaw = [];
+  if (!Array.isArray(credentialsRaw)) {
+    throw extensionDescriptorError('capability ' + id + ': "credentials" must be an array');
+  }
+  const credentials = [];
+  const names = new Set();
+  for (let i = 0; i < credentialsRaw.length; i++) {
+    const credential = validateCredentialBinding(credentialsRaw[i], id, i);
+    if (names.has(credential.name)) {
+      throw extensionDescriptorError('capability ' + id + ': duplicate credential name "' + credential.name + '" in credentials[' + i + ']');
+    }
+    names.add(credential.name);
+    credentials.push(credential);
+  }
   return {
     kind: 'capability',
     id: id,
@@ -346,6 +454,7 @@ function validateCapabilityDescriptor(raw) {
     plugins: extensionNormalizeStringList(raw.plugins, 'plugins', 'capability ' + id),
     skills: extensionNormalizeStringList(raw.skills, 'skills', 'capability ' + id),
     mcps: extensionNormalizeStringList(raw.mcps, 'mcps', 'capability ' + id),
+    credentials: Object.freeze(credentials),
   };
 }
 
@@ -361,6 +470,9 @@ function validateCatalogSet(catalogs) {
   const skills = new Map();
   const mcps = new Map();
   const capabilities = new Map();
+  // credential name -> capability id (C3: credential names are unique
+  // ACROSS capabilities — they are the user-facing connection keys).
+  const credentialOwners = new Map();
   const list = (v, kind) => (v === undefined || v === null ? [] : v);
   for (const raw of list(c.plugins, 'plugins')) {
     const p = validatePluginDescriptor(raw);
@@ -390,9 +502,16 @@ function validateCatalogSet(catalogs) {
         throw extensionDescriptorError('capability ' + cap.id + ' references unknown skill: ' + ref);
       }
     }
+    for (const credential of cap.credentials) {
+      const owner = credentialOwners.get(credential.name);
+      if (owner !== undefined) {
+        throw extensionDescriptorError('credential name "' + credential.name + '" is declared by both capability ' + owner + ' and capability ' + cap.id);
+      }
+      credentialOwners.set(credential.name, cap.id);
+    }
     capabilities.set(cap.id, cap);
   }
-  return { capabilities: capabilities, plugins: plugins, skills: skills, mcps: mcps };
+  return { capabilities: capabilities, plugins: plugins, skills: skills, mcps: mcps, credentialOwners: credentialOwners };
 }
 
 // ---------- production catalogs ----------
@@ -456,6 +575,22 @@ function pythonExtensionKeyOf(plugins) {
   return py.length ? py.join('|') : null;
 }
 
+// C3: did a credential's BINDING change between two versions of its
+// descriptor? origin, pathPrefix, header (case-insensitively) and scheme
+// decide; label/description edits alone keep the user's connection. The
+// Product flips a connected credential to 'needs-reconfirm' when this
+// returns true during a package version replacement. Pure data in,
+// boolean out — no validation, no manager access.
+function credentialBindingChanged(oldCredential, newCredential) {
+  const a = oldCredential || {};
+  const b = newCredential || {};
+  const header = (c) => (typeof c.header === 'string' ? c.header.toLowerCase() : null);
+  return a.origin !== b.origin
+    || a.pathPrefix !== b.pathPrefix
+    || header(a) !== header(b)
+    || a.scheme !== b.scheme;
+}
+
 // ------------------------------------------------------------
 //  CapabilityManager
 //
@@ -476,6 +611,16 @@ class CapabilityManager {
     this._plugins = catalogs.plugins;
     this._skills = catalogs.skills;
     this._mcps = catalogs.mcps;
+    // credential name -> owning capability id (C3 catalog fact), and
+    // credential name -> connection state. Every registered credential
+    // starts needs-connection: a declared binding is not a connection.
+    this._initCredentials(catalogs);
+    // C3: credential-state change observer — the manager's first change
+    // notification surface. ApprovalController observer style: one
+    // constructor-injected callback, best-effort (a throwing observer is
+    // contained, it never breaks the mutation).
+    //   onChange({ capabilityId, name, state, previousState })
+    this._onCredentialChange = typeof o.onChange === 'function' ? o.onChange : null;
     // capabilityId -> { state, error, plugins: Map(id -> {descriptor,payload}),
     //                   skills: Map(id -> descriptor),
     //                   skillPresence: Map(skillId -> bool),
@@ -561,11 +706,23 @@ class CapabilityManager {
     this._plugins = next.plugins;
     this._skills = next.skills;
     this._mcps = next.mcps;
+    this._initCredentials(next);
     if (sources !== undefined) this.skillSources = store;
     this._enabled = new Map();
     this._mcpStates = new Map();
     this._packages = new Map();
     this._artifacts = new Map();
+  }
+
+  // C3: reset the credential name registry and the connection states from
+  // a validated catalog set. Credential state is registration-scoped, not
+  // enable-scoped: it survives enable/disable and dies with registration.
+  _initCredentials(catalogs) {
+    this._credentialOwners = catalogs.credentialOwners;
+    this._credentialStates = new Map();
+    for (const name of this._credentialOwners.keys()) {
+      this._credentialStates.set(name, CREDENTIAL_DEFAULT_STATE);
+    }
   }
 
   // Additive registration of ONE imported capability package
@@ -652,6 +809,14 @@ class CapabilityManager {
         throw extensionDescriptorError('package ' + cap.id + ': mcp ' + id + ' conflicts with an already registered mcp of the same id');
       }
     }
+    // C3: credential names are unique ACROSS capabilities — a package may
+    // not register a credential name another capability already owns.
+    for (const credential of cap.credentials) {
+      const owner = this._credentialOwners.get(credential.name);
+      if (owner !== undefined) {
+        throw extensionDescriptorError('credential name "' + credential.name + '" is declared by both capability ' + owner + ' and capability ' + cap.id);
+      }
+    }
     // Validate skill sources BEFORE committing (define() enforces the size bound).
     const probe = new SkillSourceStore();
     for (const [id, d] of skills) probe.define(id, d.version, sources[id].source);
@@ -660,6 +825,10 @@ class CapabilityManager {
     for (const [id, d] of skills) { this._skills.set(id, d); this.skillSources.define(id, d.version, sources[id].source); }
     for (const [id, d] of mcps) this._mcps.set(id, d);
     this._capabilities.set(cap.id, cap);
+    for (const credential of cap.credentials) {
+      this._credentialOwners.set(credential.name, cap.id);
+      this._credentialStates.set(credential.name, CREDENTIAL_DEFAULT_STATE);
+    }
     this._packages.set(cap.id, { plugins: [...plugins.keys()], skills: [...skills.keys()], mcps: [...mcps.keys()] });
   }
 
@@ -670,6 +839,7 @@ class CapabilityManager {
   async unregisterPackage(capabilityId, opts) {
     const owned = this._packages.get(capabilityId);
     if (!owned) throw extensionResolutionError('not a registered package: ' + String(capabilityId));
+    const cap = this._capabilities.get(capabilityId);
     const keep = !!(opts && opts.keepInstances);
     if (this._enabled.has(capabilityId)) {
       if (keep) this._enabled.delete(capabilityId);
@@ -677,6 +847,14 @@ class CapabilityManager {
     }
     this._capabilities.delete(capabilityId);
     this._packages.delete(capabilityId);
+    // C3: unregistering releases the capability's credential names and
+    // their connection states (credential state is registration-scoped).
+    for (const credential of cap.credentials) {
+      if (this._credentialOwners.get(credential.name) === capabilityId) {
+        this._credentialOwners.delete(credential.name);
+        this._credentialStates.delete(credential.name);
+      }
+    }
     const stillUsed = (field, id) => [...this._capabilities.values()].some((c) => c[field].includes(id));
     for (const id of owned.plugins) {
       if (!stillUsed('plugins', id)) { this._plugins.delete(id); this._artifacts.delete(id); }
@@ -737,6 +915,45 @@ class CapabilityManager {
       if (this._mcpState(mcpId) !== 'connected') return 'needs-connection';
     }
     return 'ready';
+  }
+
+  // ---- credential connection state (C3 §3.2) ----
+  // Credential state is REGISTRATION-scoped: it is created at catalog
+  // load / registerPackage (default needs-connection) and deleted at
+  // unregisterPackage. Enable/disable NEVER touches it — connecting an
+  // authority is orthogonal to composing with it.
+  setCredentialState(name, state) {
+    if (!this._credentialStates.has(name)) {
+      throw extensionResolutionError('unknown credential: ' + String(name));
+    }
+    if (!CREDENTIAL_STATES.includes(state)) {
+      throw extensionResolutionError('invalid credential state: ' + String(state)
+        + ' (supported: ' + CREDENTIAL_STATES.join(', ') + ')');
+    }
+    const previous = this._credentialStates.get(name);
+    if (previous === state) return state; // no change, no notification
+    this._credentialStates.set(name, state);
+    const capabilityId = this._credentialOwners.get(name);
+    if (this._onCredentialChange) {
+      try {
+        this._onCredentialChange({ capabilityId: capabilityId, name: name, state: state, previousState: previous });
+      } catch (error) {
+        try {
+          console.error('CapabilityManager: credential-state observer threw (contained):', error);
+        } catch (ignored) {}
+      }
+    }
+    return state;
+  }
+
+  // The connection state of one registered credential (default when only
+  // the catalog fact exists). Unknown names throw — callers read states
+  // of credentials they resolved through a descriptor.
+  credentialState(name) {
+    if (!this._credentialStates.has(name)) {
+      throw extensionResolutionError('unknown credential: ' + String(name));
+    }
+    return this._credentialStates.get(name);
   }
 
   // ---- enable ----
@@ -996,6 +1213,19 @@ class CapabilityManager {
     const mcps = new Map();
     for (const [capId, entry] of this._enabled) {
       const cap = this._capabilities.get(capId);
+      // C3: credential BINDINGS are catalog facts (safe routing metadata,
+      // never secret values) — every snapshot capability carries them with
+      // their current connection state, error-state capabilities included.
+      const credentials = this._freeze(cap.credentials.map((c) => ({
+        name: c.name,
+        label: c.label,
+        description: c.description,
+        origin: c.origin,
+        pathPrefix: c.pathPrefix,
+        header: c.header,
+        scheme: c.scheme,
+        state: this._credentialStates.get(c.name) || CREDENTIAL_DEFAULT_STATE,
+      })));
       if (entry.state === 'error') {
         // A capability whose local resolution failed contributes nothing
         // but its (honest) error record.
@@ -1004,6 +1234,7 @@ class CapabilityManager {
           description: cap.description, state: entry.state, error: entry.error,
           pluginIds: [], skillIds: [], mcpIds: [], skillPaths: [],
           includes: { plugins: 0, skills: 0, mcps: 0 },
+          credentials: credentials,
         }));
         continue;
       }
@@ -1042,6 +1273,7 @@ class CapabilityManager {
         pluginIds: pluginIds, skillIds: skillIds, mcpIds: mcpIds,
         skillPaths: skillPaths,
         includes: { plugins: pluginIds.length, skills: skillIds.length, mcps: mcpIds.length },
+        credentials: credentials,
       }));
     }
     const pluginList = [];
@@ -1164,7 +1396,7 @@ class CapabilityManager {
 // Runtime's own copies; see docs/EXTRACTION-PLAN.md).
 export {
   CapabilityManager, SkillSourceStore, pythonExtensionKeyOf,
-  validatePluginPayload,
+  validatePluginPayload, credentialBindingChanged, CREDENTIAL_STATES,
   EXTENSION_ID_PATTERN, EXTENSION_PY_MODULE_PATTERN,
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
 };

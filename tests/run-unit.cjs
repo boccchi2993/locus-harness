@@ -20,12 +20,17 @@ const SUITES = [
   'context-window.test.mjs',
   // approval
   'approval.test.mjs',
+  // C3 persistent approval grants (scope 'persistent' + the persistentGrants port)
+  'approval-persistent.test.cjs',
   // image capability
   'image-probe.test.mjs',
   // capability composition core
   'capability-composition.test.mjs',
   // incremental capability package registration (wheel artifacts, skill upgrade rule)
   'capability-packages.test.mjs',
+  // C3 credential bindings in capability descriptors (validation, cross-
+  // capability name uniqueness, credential state, snapshot entries)
+  'capability-credentials.test.cjs',
   // wheel-only plugins (D10 §6): no source-text payloads, no provider seam
   'wheel-only-plugins.test.mjs',
   // public-entry contract surface (M3b review R1: the descriptor validators

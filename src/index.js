@@ -89,6 +89,13 @@ export {
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
 } from './extension-composition.js';
 
+// C3 credential-binding contract (consumed by the Product during package
+// version replacement: a changed binding flips a connected credential to
+// needs-reconfirm; the state vocabulary ships with it).
+export {
+  credentialBindingChanged, CREDENTIAL_STATES,
+} from './extension-composition.js';
+
 // ---------- public descriptor + skill-instance contract (M3b review R1) ----------
 // The first-round review audit (EXTRACTION-PLAN §3) found real Product
 // consumers of the composition contract that the extraction had left on the
@@ -227,6 +234,8 @@ export function harnessCapabilities() {
   declaration.capabilities.capabilityPackages = true;   // registerPackage / unregisterPackage / wheel payload / skill upgrade rule
   declaration.capabilities.tokenCalibrationSnapshot = true; // tokenCalibration / restoreTokenCalibration
   declaration.capabilities.wheelOnlyPlugins = true;     // D10: no source-text plugin payloads, no PluginRuntimeProvider seam
+  declaration.capabilities.capabilityCredentials = true; // C3: credentials in capability descriptors, credential state, credentialBindingChanged
+  declaration.capabilities.persistentApprovalGrants = true; // C3: scope 'persistent' + persistentGrants port
 
   return deepFreezeDeclaration(declaration);
 }
