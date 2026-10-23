@@ -5,6 +5,7 @@
 
 本仓库是 Locus 三仓结构中的 harness：模型驱动的 agent 执行与编排（agent loop、provider 协议适配、审批、任务生命周期），不依赖 runtime 或 product 独立构建与测试。
 另两个仓库：[locus-product](https://github.com/boccchi2993/locus-product)、[locus-runtime](https://github.com/boccchi2993/locus-runtime)。
+官方参考能力包在 [locus-example-capabilities](https://github.com/boccchi2993/locus-example-capabilities)（见 locus-product docs/DECISIONS.md D11）。
 
 ## 架构决定
 
