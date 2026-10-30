@@ -42,3 +42,13 @@ Acceptance: negative tests fail on the old script and pass after the fix; normal
   ```
 
 - Same event, classification and rerun evidence: (a) browser/CDP startup or readiness failure — the same intermittent CDP readiness class this section tracks via [RT-CI-001](https://github.com/boccchi2993/locus-runtime/blob/main/TODO.md). Rationale: the error is the harness's own `readinessError` diagnostic (`tests/chrome-helper.cjs`) raised at `phase=cdp` (`elapsedMs=15186`) before any gate executed (`0 passed, 1 failed` is the phase verdict, not an assertion result), so it is not a test-assertion failure; the same job's npm pack / consumer assemble / install / build steps all succeeded in attempt 1, so it is not a network or npm failure; Chrome stayed alive (`alive=yes exitCode=null signal=none`) but first printed its DevTools-listening line roughly 10–15s after launch, i.e. at/after the ~15s readiness probe had already aborted its `/json/version` and `/json/list` fetches. Rerun: the first failure was rerun within about 2 minutes and the rerun passed — attempt 2 started 18:05:21Z (attempt 1 began 18:03:28Z, the job itself failed ~18:04:29Z) and passed every step of the same job on the same commit, including the browser gate and the lifecycle fault self-proof; the post-merge main run [38946302420](https://github.com/boccchi2993/locus-harness/actions/runs/38946302420) also passed all four jobs. Per this section's discipline, green reruns do not establish cause.
+- 进展 2026-10-30：product PR #52（CI-STAB，合并提交 a70c301）的修复与诊断（同 [runtime TODO RT-CI-001](https://github.com/boccchi2993/locus-runtime/blob/main/TODO.md) 下 2026-10-30 追记）：product 的 `tests/helpers/chrome.cjs` 改为 `--remote-debugging-port=0` + 读取 DevToolsActivePort、就绪等待 60 秒、服务端口 EADDRINUSE 重试；本节 2026-10-16 的证据（Chrome 启动后约 10–15 秒才打印 DevTools 监听行，与 15 秒就绪超时吻合）与该诊断一致。harness 的 `tests/chrome-helper.cjs` 尚未移植该修复。
+
+## 2026-10-30 新增条目
+
+### HN-CI-NODE24（harness）：GitHub Actions "Node.js 20 is deprecated" 警告
+
+- [ ] Open. Owner: Harness CI。
+- 现状：GitHub Actions 每次运行都有 "Node.js 20 is deprecated" 警告：actions/checkout@v4、actions/setup-node@v4、actions/upload-artifact@v4 被强制以 Node 24 运行。
+- 下一步：三个仓库各需升级 action 版本（product 侧见 product TODO 的 CI-NODE24 条目）。
+- 验收：CI 运行不再出现该 deprecation 警告。
