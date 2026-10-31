@@ -342,7 +342,7 @@ async function run() {
       'history=' + session.history.length + ' modelCalls=' + modelCalls);
   }
 
-  // ---------- S14. iteration limit (MAX_TOOL_ITERATIONS = 32) ----------
+  // ---------- S14. iteration limit (default maxToolCalls = 128; 2026-10-31 owner decision) ----------
   {
     let modelCalls = 0;
     let toolExecs = 0;
@@ -352,7 +352,7 @@ async function run() {
     });
     await session.run('loop forever', { workspace: WS_A });
     check('S14 iteration cap stops the loop at MAX_TOOL_ITERATIONS',
-      MAX_TOOL_ITERATIONS === 32 && modelCalls === 32 && toolExecs === 32,
+      MAX_TOOL_ITERATIONS === 128 && modelCalls === 128 && toolExecs === 128,
       'max=' + MAX_TOOL_ITERATIONS + ' model=' + modelCalls + ' tools=' + toolExecs);
     check('S14b iteration_limit warning + task_end',
       events.some((e) => e.type === 'warning' && e.code === 'iteration_limit')
@@ -710,15 +710,19 @@ async function run() {
   }
 
   // ---------- N7. tool cap counts CALLS, not turns; oversized batch never partially executes ----------
+  // maxToolCalls pinned to 32: the DEFAULT is 128 since 2026-10-31; the
+  // batch-boundary math (6×5=30, 7th batch refused) is preserved under an
+  // explicit config, which also exercises the new session option.
   {
     let execs = 0;
     const { session, events } = newSession({
+      maxToolCalls: 32,
       modelClient: async () => envelope('', { toolCalls: [1, 2, 3, 4, 5].map((n) => ({
         id: 'b' + n, name: 'bash', input: { input: 'cmd' + n }, argumentsError: null })) }),
       toolPort: asToolPort(async () => { execs++; return { output: 'ok', success: true }; }),
     });
     await session.run('loop', { workspace: WS_A });
-    check('N7 total executions bounded by 32 across batches (6×5=30, 7th batch refused)',
+    check('N7 total executions bounded by the pinned cap 32 across batches (6×5=30, 7th batch refused)',
       execs === 30, 'execs=' + execs);
     check('N7b iteration_limit warning + task_end, no partial batch',
       events.some((e) => e.type === 'warning' && e.code === 'iteration_limit' && e.message.includes('未执行'))
@@ -831,10 +835,13 @@ async function run() {
       && !orphan.test(pairCut), JSON.stringify(pairCut.slice(1990, 2010)));
 
     // TR4: the model-boundary feedback path actually carries head AND tail
-    // of a long tool output
+    // of a long tool output. toolResultMaxChars pinned to the old 6000 so
+    // the 20006-char fixture still truncates (the default is 40000 since
+    // the 2026-10-31 owner decision).
     const longOutput = 'HEAD>>' + 'x'.repeat(19990) + '<<TAIL';
     let feedback = null;
     const { session } = newSession({
+      toolResultMaxChars: 6000,
       modelClient: (() => { let n = 0; return async (body) => {
         if (++n === 1) return TOOL_CALL;
         feedback = body.messages[body.messages.length - 1].content;
