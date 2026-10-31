@@ -18,6 +18,10 @@ const SUITES = [
   'agent-image.test.mjs',
   'request-budget.test.mjs',
   'context-window.test.mjs',
+  // configurable task limits (2026-10-31 owner decision: maxToolCalls /
+  // toolResultMaxChars + clamping diagnostics + context-window share +
+  // wrap-up reminders + abort/truncation wording)
+  'task-limits.test.mjs',
   // approval
   'approval.test.mjs',
   // C3 persistent approval grants (scope 'persistent' + the persistentGrants port)
