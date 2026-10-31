@@ -18,6 +18,11 @@ const {
 
 const INITIAL_PORT = Number(process.env.CONSUMER_PREVIEW_PORT || 4931);
 const OUT_PATH = path.join(__dirname, 'consumer-server.json');
+// Filesystem path (NOT require.resolve): vite's "exports" map does not
+// expose './bin/vite.js', so a subpath resolve throws
+// ERR_PACKAGE_PATH_NOT_EXPORTED. Same convention as the repo-side
+// orchestrators (tests/e2e.cjs) and product's gates.
+const VITE_CLI = path.join(path.dirname(__dirname), 'node_modules', 'vite', 'bin', 'vite.js');
 
 async function main() {
   try { fs.rmSync(OUT_PATH, { force: true }); } catch (e) {}
@@ -25,7 +30,7 @@ async function main() {
   try {
     service = await startServiceWithRetry(async (port) => {
       const child = launchManagedProcess(process.execPath, [
-        require.resolve('vite/bin/vite.js'),
+        VITE_CLI,
         'preview', '--host', '127.0.0.1', '--port', String(port), '--strictPort',
       ], { cwd: path.dirname(__dirname), port, label: 'vite preview (consumer)' });
       try {
