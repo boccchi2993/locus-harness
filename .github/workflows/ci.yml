@@ -10,10 +10,10 @@ jobs:
     name: unit tests (Node)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: AGENTS.md and CLAUDE.md must be identical
         run: cmp AGENTS.md CLAUDE.md
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -26,8 +26,8 @@ jobs:
     name: build + package checks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -52,8 +52,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [unit, build]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -68,8 +68,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [unit, build]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -97,6 +97,7 @@ jobs:
           mkdir -p "$CONSUMER_DIR/tests"
           cp tools/consumer-e2e/e2e-consumer.cjs "$CONSUMER_DIR/tests/e2e-consumer.cjs"
           cp tools/consumer-e2e/e2e-consumer-faults.cjs "$CONSUMER_DIR/tests/e2e-consumer-faults.cjs"
+          cp tools/consumer-e2e/serve-consumer.cjs "$CONSUMER_DIR/tests/serve-consumer.cjs"
           cp tests/helpers/chrome.cjs "$CONSUMER_DIR/tests/chrome-helper.cjs"
           echo "CONSUMER_DIR=$CONSUMER_DIR" >> "$GITHUB_ENV"
           echo "consumer assembled at: $CONSUMER_DIR"
@@ -123,11 +124,21 @@ jobs:
         run: |
           CHROME=$(which google-chrome || which chromium || true)
           export CHROME
-          npx vite preview --host 127.0.0.1 --port 4931 --strictPort &
-          for i in $(seq 1 40); do
-            if curl -sf -o /dev/null http://127.0.0.1:4931/; then break; fi
+          # The preview bind goes through the shared EADDRINUSE port-retry
+          # (tests/serve-consumer.cjs → startServiceWithRetry, at most 3
+          # retries on freshly allocated ports) BEFORE any gate runs; the
+          # resolved URL lands in tests/consumer-server.json and the gate
+          # drivers follow it.
+          node tests/serve-consumer.cjs &
+          for i in $(seq 1 60); do
+            if [ -f tests/consumer-server.json ]; then break; fi
             sleep 0.5
           done
+          if [ ! -f tests/consumer-server.json ]; then
+            echo 'consumer preview did not become ready (no tests/consumer-server.json)'
+            exit 1
+          fi
+          cat tests/consumer-server.json
           node tests/e2e-consumer.cjs
       # M3b review R1 (F2): the same built consumer runs the lifecycle fault
       # self-proof — the shared verdict must pass the clean control and

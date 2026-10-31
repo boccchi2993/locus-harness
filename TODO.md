@@ -43,6 +43,16 @@ Acceptance: negative tests fail on the old script and pass after the fix; normal
 
 - Same event, classification and rerun evidence: (a) browser/CDP startup or readiness failure — the same intermittent CDP readiness class this section tracks via [RT-CI-001](https://github.com/boccchi2993/locus-runtime/blob/main/TODO.md). Rationale: the error is the harness's own `readinessError` diagnostic (`tests/chrome-helper.cjs`) raised at `phase=cdp` (`elapsedMs=15186`) before any gate executed (`0 passed, 1 failed` is the phase verdict, not an assertion result), so it is not a test-assertion failure; the same job's npm pack / consumer assemble / install / build steps all succeeded in attempt 1, so it is not a network or npm failure; Chrome stayed alive (`alive=yes exitCode=null signal=none`) but first printed its DevTools-listening line roughly 10–15s after launch, i.e. at/after the ~15s readiness probe had already aborted its `/json/version` and `/json/list` fetches. Rerun: the first failure was rerun within about 2 minutes and the rerun passed — attempt 2 started 18:05:21Z (attempt 1 began 18:03:28Z, the job itself failed ~18:04:29Z) and passed every step of the same job on the same commit, including the browser gate and the lifecycle fault self-proof; the post-merge main run [38946302420](https://github.com/boccchi2993/locus-harness/actions/runs/38946302420) also passed all four jobs. Per this section's discipline, green reruns do not establish cause.
 - 进展 2026-10-30：product PR #52（CI-STAB，合并提交 a70c301）的修复与诊断（同 [runtime TODO RT-CI-001](https://github.com/boccchi2993/locus-runtime/blob/main/TODO.md) 下 2026-10-30 追记）：product 的 `tests/helpers/chrome.cjs` 改为 `--remote-debugging-port=0` + 读取 DevToolsActivePort、就绪等待 60 秒、服务端口 EADDRINUSE 重试；本节 2026-10-16 的证据（Chrome 启动后约 10–15 秒才打印 DevTools 监听行，与 15 秒就绪超时吻合）与该诊断一致。harness 的 `tests/chrome-helper.cjs` 尚未移植该修复。
+- 进展 2026-10-31：harness 侧移植（PR #16，分支 `test/ci-port-chrome-readiness`）。2026-10-31 main push run [41185934066](https://github.com/boccchi2993/locus-harness/actions/runs/41185934066)（合并提交 `bdb10db`，PR #15 之后）的同一 job `out-of-checkout tarball consumer (headless Chrome)` 再次以同签名失败，`--log-failed` 关键行：
+
+  ```
+  CONSUMER-E2E ERROR: Error: CDP browser endpoint unavailable: readiness timeout
+  phase=cdp elapsedMs=15001
+  Chrome alive=yes exitCode=null signal=none
+  0 passed, 1 failed
+  ```
+
+  所有者决定不重跑、移植修复。本次把 product a70c301 的三项修复移植进 harness 的 `tests/helpers/chrome.cjs`（consumer job 拷贝为 `tests/chrome-helper.cjs`，同一文件覆盖两个入口）：Chrome `--remote-debugging-port=0` + 从 profile 目录 DevToolsActivePort 文件读取实际端口（消除 allocateFreePort 的释放/重绑竞态）、CDP 就绪等待默认 60 秒（`DEFAULT_CDP_TIMEOUT_MS`，显式传 15000 的 waitForCdp 调用点改用默认值）、服务端口 EADDRINUSE 换端口重试（`startServiceWithRetry`/`listenWithRetry`，最多 3 次，在任何检查执行之前）——覆盖 `tests/e2e.cjs` 的 vite preview 与 CI consumer job 的预览服务（新增 `tools/consumer-e2e/serve-consumer.cjs`）；并补 `tests/chrome-helper.test.cjs`（DevToolsActivePort 正常/迟到/内容异常解析、EADDRINUSE 第二次成功/三次耗尽的完整报错），注册进 `tests/run-unit.cjs`。按本节原有验收标准，仅加超时不能关单：本次是移植 port 0 / DevToolsActivePort 消除端口竞态并加超时兜底，待合并后观察一段时间再由所有者决定是否关单。
 
 ## 2026-10-30 新增条目
 
