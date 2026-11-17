@@ -6,6 +6,7 @@
 // boundary on the built artifact.
 // Run: node tests/e2e-consumer.cjs  (CONSUMER_URL or the default preview URL)
 const fs = require('fs/promises');
+const fss = require('fs');
 const os = require('os');
 const path = require('path');
 const {
@@ -13,7 +14,19 @@ const {
   waitForPageTarget, waitForRuntimeCondition,
 } = require('./chrome-helper.cjs');
 
-const HOST_URL = process.env.CONSUMER_URL || 'http://127.0.0.1:4931/';
+// The preview launcher (tests/serve-consumer.cjs) writes the resolved URL
+// after the EADDRINUSE port-retry may have moved the port; prefer it over
+// the static default when no explicit URL env is set.
+function consumerServerUrl(envName, defaultPath) {
+  if (process.env[envName]) return process.env[envName];
+  try {
+    const server = JSON.parse(fss.readFileSync(path.join(__dirname, 'consumer-server.json'), 'utf8'));
+    if (server && typeof server.url === 'string') return server.url.replace(/\/+$/, '') + defaultPath;
+  } catch (e) { /* no launcher JSON: fall through to the static default */ }
+  return 'http://127.0.0.1:4931' + defaultPath;
+}
+
+const HOST_URL = consumerServerUrl('CONSUMER_URL', '/');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -56,7 +69,7 @@ async function main() {
       label: 'consumer Chrome',
       profileDir,
     });
-    await waitForCdp(chrome, { timeoutMs: 15000 });
+    await waitForCdp(chrome);
     const target = await waitForPageTarget(chrome, HOST_URL, { timeoutMs: 15000 });
     cdp = await connectToTarget(target);
     await waitForRuntimeCondition(cdp, 'document.title === "consumer-ready"',

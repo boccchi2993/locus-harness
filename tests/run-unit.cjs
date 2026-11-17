@@ -51,6 +51,11 @@ const SUITES = [
   'harness-standalone.test.mjs',
   'harness-boundary.test.cjs',
   'import-purity.test.mjs',
+  // chrome helper infrastructure (test/ci-port-chrome-readiness): the
+  // DevToolsActivePort parsing and the EADDRINUSE service-port retry
+  // ported from product PR #52 — parsing (normal / CRLF / missing second
+  // line / malformed), the late-file waitForCdp path and the retry shapes
+  'chrome-helper.test.cjs',
   // HN-TEST-001: the real tests/e2e.cjs orchestrator's success
   // classification (exit 0 / nonzero / signal / spawn error), driven
   // through the TEST-ONLY gate seams. Four real orchestrator runs,
