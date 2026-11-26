@@ -428,6 +428,150 @@ async function run() {
       granted.viaGrant === true);
   }
 
+  // ---------- V. elicitation kind (C3 phase-2 §8.4) ----------
+  {
+    const elicitSpec = (overrides) => Object.assign({
+      kind: 'elicitation',
+      action: { type: 'mcp-form', summary: 'Answer the form from server acme-docs' },
+      elicitation: {
+        message: 'Which workspace should be searched?',
+        requestedSchema: { type: 'object', properties: { workspace: { type: 'string', enum: ['alpha', 'beta'] } }, required: ['workspace'] },
+      },
+    }, overrides || {});
+    check('V1 APPROVAL_KINDS declares elicitation with the fixed outcome set',
+      JSON.stringify(APPROVAL_KINDS.elicitation) === JSON.stringify(
+        { outcomes: ['accept', 'decline', 'cancel'], sessionScope: false, persistentScope: false }));
+
+    // accept / decline / cancel
+    const accept = newController();
+    const pa = accept.c.request(elicitSpec());
+    check('V2 pending elicitation carries the elicitation payload',
+      accept.c.pending.kind === 'elicitation'
+      && accept.c.pending.elicitation.message === 'Which workspace should be searched?'
+      && accept.c.pending.elicitation.requestedSchema.type === 'object');
+    accept.c.resolve(accept.c.pending.id, { outcome: 'accept', content: { workspace: 'alpha' } });
+    const da = await pa;
+    check('V3 accept resolves with the carried content',
+      da.outcome === 'accept' && da.scope === 'once' && da.content
+      && da.content.workspace === 'alpha' && !('reason' in da));
+
+    const decline = newController();
+    const pd = decline.c.request(elicitSpec());
+    decline.c.resolve(decline.c.pending.id, { outcome: 'decline' });
+    check('V4 decline resolves clean', (await pd).outcome === 'decline');
+
+    const cancel = newController();
+    const pc = cancel.c.request(elicitSpec());
+    cancel.c.resolve(cancel.c.pending.id, { outcome: 'cancel' });
+    check('V5 cancel resolves as a user outcome', (await pc).outcome === 'cancel');
+
+    // accept WITHOUT content is legal too (a form with no answers)
+    const acceptBare = newController();
+    const pb = acceptBare.c.request(elicitSpec());
+    acceptBare.c.resolve(acceptBare.c.pending.id, { outcome: 'accept' });
+    const db = await pb;
+    check('V6 accept without content resolves without a content key', db.outcome === 'accept' && !('content' in db));
+
+    // invalid content shapes are caller bugs, thrown loudly
+    const badContent = (name, decision) => {
+      const h = newController();
+      h.c.request(elicitSpec());
+      try {
+        h.c.resolve(h.c.pending.id, decision);
+        check(name, false, 'expected throw');
+      } catch (e) {
+        check(name, e.code === 'invalid_decision' && h.c.hasPending()
+          && String(e.message).includes('cannot carry content'), e.code + ': ' + e.message);
+      }
+    };
+    badContent('V7 decline cannot carry content', { outcome: 'decline', content: { x: 1 } });
+    badContent('V8 cancel cannot carry content', { outcome: 'cancel', content: {} });
+    badContent('V9 accept with a non-object content is rejected', { outcome: 'accept', content: 'alpha' });
+    badContent('V10 accept with an array content is rejected', { outcome: 'accept', content: ['alpha'] });
+    const permContent = newController();
+    permContent.c.request(permSpec('perm:content'));
+    try {
+      permContent.c.resolve(permContent.c.pending.id, { outcome: 'allow', content: { x: 1 } });
+      check('V11 permission decisions cannot carry content', false, 'expected throw');
+    } catch (e) {
+      check('V11 permission decisions cannot carry content', e.code === 'invalid_decision' && permContent.c.hasPending());
+    }
+
+    // the elicitation request field is elicitation-only
+    try {
+      newController().c.request(Object.assign(permSpec('perm:elicit'), {
+        elicitation: { message: 'x' },
+      }));
+      check('V13 a permission request carrying the elicitation field fails loudly', false, 'expected throw');
+    } catch (e) {
+      check('V13 a permission request carrying the elicitation field fails loudly',
+        e.code === 'invalid_elicitation', e.code + ': ' + e.message);
+    }
+    try {
+      newController().c.request(elicitSpec({ elicitation: 'form' }));
+      check('V14 a non-object elicitation payload fails loudly', false, 'expected throw');
+    } catch (e) {
+      check('V14 a non-object elicitation payload fails loudly', e.code === 'invalid_elicitation');
+    }
+
+    // stale id is a no-op; the newer request stays pending
+    const stale = newController();
+    const ps1 = stale.c.request(elicitSpec());
+    const id1 = stale.c.pending.id;
+    stale.c.resolve(id1, { outcome: 'accept', content: {} });
+    await ps1;
+    const ps2 = stale.c.request(elicitSpec());
+    const id2 = stale.c.pending.id;
+    check('V15 resolving the stale id does not settle the newer request',
+      stale.c.resolve(id1, { outcome: 'decline' }) === false && stale.c.hasPending()
+      && stale.c.pending.id === id2);
+    stale.c.resolve(id2, { outcome: 'cancel' });
+    check('V16 the newer request still settles by its own id', (await ps2).outcome === 'cancel');
+
+    // the task cancel signal settles the form as cancelled
+    const abort = newController();
+    const ac = new AbortController();
+    const pap = abort.c.request(elicitSpec(), { signal: ac.signal });
+    ac.abort();
+    check('V17 the abort signal settles a pending form as cancelled', (await pap).outcome === 'cancelled');
+    const preAborted = newController();
+    const signal2 = new AbortController();
+    signal2.abort();
+    check('V18 a request on an already-aborted signal resolves cancelled without pending',
+      (await preAborted.c.request(elicitSpec(), { signal: signal2.signal })).outcome === 'cancelled'
+      && !preAborted.c.hasPending());
+
+    // a second pending request fails loudly (form + approval never share the card)
+    const busy = newController();
+    busy.c.request(elicitSpec());
+    try {
+      busy.c.request(elicitSpec());
+      check('V19 a second request while a form is pending throws ApprovalBusyError', false, 'expected throw');
+    } catch (e) {
+      check('V19 a second request while a form is pending throws ApprovalBusyError',
+        e.name === 'ApprovalBusyError' && e.code === 'approval_busy');
+    }
+
+    // grants never auto-settle an elicitation, even on a colliding key
+    const grants = newController();
+    const pg = grants.c.request(permSpec('perm:cross'));
+    grants.c.resolve(grants.c.pending.id, { outcome: 'allow', scope: 'session' });
+    await pg;
+    const pe = grants.c.request(elicitSpec({ policyKey: 'perm:cross' }));
+    check('V20 a session grant under the same key does not auto-resolve an elicitation',
+      grants.c.hasPending() && grants.c.pending.kind === 'elicitation');
+    grants.c.resolve(grants.c.pending.id, { outcome: 'decline' });
+    check('V21 the elicitation settles interactively', (await pe).outcome === 'decline');
+
+    // cancelAll (task boundary) settles a pending form
+    const boundary = newController();
+    const pbo = boundary.c.request(elicitSpec());
+    boundary.c.cancelAll('task_end');
+    const dbo = await pbo;
+    check('V22 cancelAll settles a pending form as cancelled with the reason',
+      dbo.outcome === 'cancelled' && dbo.reason === 'task_end');
+  }
+
   console.log('---');
   console.log(failed ? failed + ' check(s) FAILED' : 'all ' + passed + ' approval core checks passed');
   process.exit(failed ? 1 : 0);

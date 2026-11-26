@@ -302,6 +302,53 @@ async function run() {
   check('CP4.b identical shared components co-register',
     m4.listCapabilities().some((c) => c.id === 'cap-b') && m4.isPackage('cap-b'));
 
+  // ================= CP16. package mcp binding (C3 phase-2 §10.2) =================
+  const mcpPkg = (opts) => {
+    const o = opts || {};
+    return {
+      capability: {
+        id: o.id || 'mcp-cap', version: '1', displayName: 'MCP Package Capability',
+        description: 'TEST ONLY mcp package proof.',
+        plugins: [], skills: [], mcps: ['mcp-svc'],
+        credentials: o.credentials === undefined ? [{
+          name: 'MCP_TOKEN', label: 'MCP token', origin: 'https://mcp.example.test',
+          pathPrefix: '/', header: 'Authorization', scheme: 'Bearer',
+        }] : o.credentials,
+      },
+      plugins: [], skills: [],
+      mcps: [{
+        id: 'mcp-svc', displayName: 'MCP Service', description: 'TEST ONLY authority',
+        url: 'https://mcp.example.test/mcp', auth: 'bearer', credential: 'MCP_TOKEN',
+      }],
+      sources: {}, artifacts: {},
+    };
+  };
+  const m16 = newPackageManager(new MemoryInstanceStore());
+  await m16.registerPackage(mcpPkg());
+  check('CP16.a a package mcp with a satisfied binding registers',
+    m16.isPackage('mcp-cap'));
+  await throwsWith('CP16.b a package mcp referencing an undeclared credential is refused',
+    () => newPackageManager(new MemoryInstanceStore()).registerPackage(
+      mcpPkg({ credentials: [] })),
+    'ExtensionDescriptorError', 'not declared by capability');
+  await throwsWith('CP16.c a package mcp credential missing from the descriptor is refused',
+    () => newPackageManager(new MemoryInstanceStore()).registerPackage(
+      mcpPkg({ credentials: [{ name: 'OTHER_TOKEN', label: 'Other', origin: 'https://mcp.example.test', pathPrefix: '/', header: 'Authorization', scheme: 'Bearer' }] })),
+    'ExtensionDescriptorError', 'not declared by capability');
+  const legacyMcpPkgMgr = newPackageManager(new MemoryInstanceStore());
+  await legacyMcpPkgMgr.registerPackage({
+    capability: {
+      id: 'legacy-mcp-cap', version: '1', displayName: 'Legacy MCP Capability',
+      description: 'TEST ONLY legacy mcp proof.',
+      plugins: [], skills: [], mcps: ['legacy-svc'],
+    },
+    plugins: [], skills: [],
+    mcps: [{ id: 'legacy-svc', displayName: 'Legacy Service', description: 'no endpoint' }],
+    sources: {}, artifacts: {},
+  });
+  check('CP16.d a legacy (no-endpoint) mcp package registers without any credential',
+    legacyMcpPkgMgr.isPackage('legacy-mcp-cap'));
+
   // ================= CP6. the task snapshot carries wheel METADATA only =================
   const m6 = newPackageManager(new MemoryInstanceStore());
   await m6.registerPackage(pkgA({ artifact: await artifactFor(WHEEL_A) }));

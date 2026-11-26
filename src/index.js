@@ -111,7 +111,7 @@ export {
 // here, the same values the manager itself uses.
 export {
   validateCapabilityDescriptor, validatePluginDescriptor,
-  validateSkillDescriptor, validateMcpDescriptor,
+  validateSkillDescriptor, validateMcpDescriptor, validateMcpBinding,
   skillInstancePath, SKILL_INSTANCE_ROOT, SKILL_INSTANCE_MARKER,
   SKILL_INSTANCE_MAX_BYTES, sha256Hex,
 } from './extension-composition.js';
@@ -236,6 +236,7 @@ export function harnessCapabilities() {
   declaration.capabilities.wheelOnlyPlugins = true;     // D10: no source-text plugin payloads, no PluginRuntimeProvider seam
   declaration.capabilities.capabilityCredentials = true; // C3: credentials in capability descriptors, credential state, credentialBindingChanged
   declaration.capabilities.persistentApprovalGrants = true; // C3: scope 'persistent' + persistentGrants port
+  declaration.capabilities.capabilityMcp = true; // C3 phase-2 §10.2: mcp endpoint fields, validateMcpBinding, approval 'elicitation' kind
 
   return deepFreezeDeclaration(declaration);
 }

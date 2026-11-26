@@ -310,22 +310,152 @@ class SkillSourceStore {
 }
 
 // ---------- MCP requirement descriptor ----------
-// V1 carries the requirement REFERENCE only: id + display metadata. There
-// is deliberately NO connector, no transport, no OAuth and no credential
-// storage here. MCP adds authority, so an MCP requirement contributes
-// "needs-connection" state until an explicit connection decision (never
-// as a side effect of enabling a capability).
+// V1 carries the requirement REFERENCE: id + display metadata. C3
+// phase-2 (§3.2) adds three OPTIONAL endpoint fields — url, auth,
+// credential — that make a server connectable. They are all-or-nothing:
+// all three present is a connectable server, all three absent is a
+// legacy entry (§3.5, state unavailable/no-endpoint downstream), a
+// partial set is a descriptor fault. Everything else about the shape
+// stays exactly as before. There is still NO connector, no transport,
+// no OAuth and no credential storage here — `credential` is a NAME
+// reference into the declaring capability's credentials (validated
+// against the capability by validateMcpBinding), never a value.
+const MCP_URL_MAX_LENGTH = 2048;
+
+// The three endpoint fields, validated per C3 phase-2 §3.2. Returns
+// { url, auth, credential } when declared, null for a legacy entry.
+// Throws ExtensionDescriptorError naming the offending field.
+function validateMcpEndpointFields(raw, id) {
+  const at = 'mcp ' + id;
+  const present = ['url', 'auth', 'credential'].filter((f) => raw[f] !== undefined);
+  if (present.length === 0) return null;
+  if (present.length < 3) {
+    const missing = ['url', 'auth', 'credential'].filter((f) => !present.includes(f));
+    throw extensionDescriptorError(at + ': "url", "auth" and "credential" are declared together'
+      + ' (all three make the server connectable, none keeps it a legacy entry); missing: '
+      + missing.map((f) => '"' + f + '"').join(', '));
+  }
+  // auth: this version accepts exactly "bearer". Declaring "oauth" (or
+  // anything else) fails loudly at validation so an author sees WHY the
+  // package is refused, not a silent downgrade.
+  if (raw.auth !== 'bearer') {
+    throw extensionDescriptorError(at + ': "auth" must be "bearer" (this version supports bearer only), got '
+      + JSON.stringify(raw.auth === undefined ? null : raw.auth));
+  }
+  if (typeof raw.credential !== 'string' || !CREDENTIAL_NAME_PATTERN.test(raw.credential)) {
+    throw extensionDescriptorError(at + ': "credential" must match ' + CREDENTIAL_NAME_PATTERN
+      + ', got ' + JSON.stringify(raw.credential === undefined ? null : raw.credential));
+  }
+  const rawUrl = raw.url;
+  if (typeof rawUrl !== 'string' || !rawUrl) {
+    throw extensionDescriptorError(at + ': "url" must be a non-empty string, got '
+      + JSON.stringify(rawUrl === undefined ? null : rawUrl));
+  }
+  if (rawUrl.length > MCP_URL_MAX_LENGTH) {
+    throw extensionDescriptorError(at + ': "url" is ' + rawUrl.length
+      + ' characters, over the ' + MCP_URL_MAX_LENGTH + '-character limit');
+  }
+  let parsed = null;
+  try { parsed = new URL(rawUrl); } catch (e) { parsed = null; }
+  // Query and fragment are refused outright: some providers accept tokens
+  // in the query string, and such an address must never enter a package.
+  if (!parsed || parsed.protocol !== 'https:' || parsed.username || parsed.password
+    || parsed.search || parsed.hash) {
+    throw extensionDescriptorError(at + ': "url" must be an https URL without userinfo, query or fragment, got '
+      + JSON.stringify(rawUrl));
+  }
+  // Canonical form ONLY: host lowercase, no default port, no dot segments,
+  // non-empty path — so every address has exactly one spelling and the
+  // connection record's "as confirmed" comparison is plain string equality.
+  if (parsed.href !== rawUrl) {
+    throw extensionDescriptorError(at + ': "url" must be written in its canonical form (new URL(raw).href === raw,'
+      + ' e.g. "https://mcp.acme.example/" not "https://mcp.acme.example"), got ' + JSON.stringify(rawUrl));
+  }
+  if (!hostIsPublicDnsName(parsed.hostname)) {
+    throw extensionDescriptorError(at + ': "url" host ' + JSON.stringify(parsed.hostname)
+      + ' is not a public DNS name (MCP servers are reached only at public hosts)');
+  }
+  const pathname = parsed.pathname;
+  if (!pathname.startsWith('/') || pathname.includes('..') || pathname.includes('//')
+    || pathname.includes('%')) {
+    throw extensionDescriptorError(at + ': "url" pathname must start with "/" and contain none of "..", "//", "%", got '
+      + JSON.stringify(pathname));
+  }
+  return { url: rawUrl, auth: raw.auth, credential: raw.credential };
+}
+
 function validateMcpDescriptor(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw extensionDescriptorError('mcp descriptor must be an object');
   }
   const id = extensionRequireId(raw.id, 'mcp');
-  return {
+  const descriptor = {
     kind: 'mcp',
     id: id,
     displayName: typeof raw.displayName === 'string' && raw.displayName.trim() ? raw.displayName : id,
     description: typeof raw.description === 'string' ? raw.description : '',
   };
+  // Endpoint fields are appended LAST and only when declared: a legacy
+  // descriptor normalizes to exactly the four baseline keys, so old
+  // packages keep byte-identical locks (C3 phase-2 §3.5).
+  const endpoint = validateMcpEndpointFields(raw, id);
+  if (endpoint) {
+    descriptor.url = endpoint.url;
+    descriptor.auth = endpoint.auth;
+    descriptor.credential = endpoint.credential;
+  }
+  return descriptor;
+}
+
+// C3 phase-2 §3.3: the binding rules between a connectable MCP descriptor
+// and the capability that declares it. mcp/capability are VALIDATED
+// descriptors (products of validateMcpDescriptor / validateCapabilityDescriptor).
+//   - a legacy descriptor (no endpoint fields) returns null: no binding to check;
+//   - otherwise every rule must hold, and a violation throws
+//     ExtensionDescriptorError whose `mcpBindingRule` names the rule
+//     ('credential-reference' | 'bearer-scheme' | 'endpoint-coverage') so a
+//     consumer can map it to its own diagnostic codes.
+// Pure data in — no registry, no state, no manager access.
+function validateMcpBinding(mcp, capability) {
+  if (!mcp || typeof mcp !== 'object' || mcp.url === undefined) return null;
+  const cap = capability || {};
+  const id = mcp.id;
+  const declared = Array.isArray(cap.credentials)
+    ? cap.credentials.find((c) => c && c.name === mcp.credential) : null;
+  if (!declared) {
+    const e = extensionDescriptorError('mcp ' + id + ': credential "' + String(mcp.credential)
+      + '" is not declared by capability ' + String(cap.id || '(unknown)')
+      + ' (a package server may only reference a credential of its own capability)');
+    e.mcpBindingRule = 'credential-reference';
+    throw e;
+  }
+  // Bearer form ONLY: the Authorization header with the Bearer scheme.
+  // An x-api-key binding or a binding without a scheme cannot carry an
+  // MCP bearer token.
+  if (declared.header !== 'authorization' || declared.scheme !== 'Bearer') {
+    const e = extensionDescriptorError('mcp ' + id + ': credential "' + declared.name
+      + '" must be a bearer binding (header "authorization", scheme "Bearer") to secure an MCP server, got header '
+      + JSON.stringify(declared.header === undefined ? null : declared.header) + ', scheme '
+      + JSON.stringify(declared.scheme === undefined ? null : declared.scheme));
+    e.mcpBindingRule = 'bearer-scheme';
+    throw e;
+  }
+  // The binding's origin + pathPrefix must COVER the server url: same
+  // origin, and the url path inside the prefix. This is where the token
+  // may travel — nowhere else.
+  let parsed = null;
+  try { parsed = new URL(mcp.url); } catch (e2) { parsed = null; }
+  const covered = !!parsed && parsed.origin === declared.origin
+    && typeof declared.pathPrefix === 'string' && parsed.pathname.startsWith(declared.pathPrefix);
+  if (!covered) {
+    const e = extensionDescriptorError('mcp ' + id + ': credential "' + declared.name
+      + '" binding (origin ' + JSON.stringify(declared.origin === undefined ? null : declared.origin)
+      + ', pathPrefix ' + JSON.stringify(declared.pathPrefix === undefined ? null : declared.pathPrefix)
+      + ') does not cover the server url ' + JSON.stringify(mcp.url));
+    e.mcpBindingRule = 'endpoint-coverage';
+    throw e;
+  }
+  return null;
 }
 
 // ---------- credential binding descriptor (C3) ----------
@@ -341,6 +471,18 @@ const CREDENTIAL_HEADER_PATTERN = /^[A-Za-z0-9-]+$/;
 // public DNS names, so loopback names and the private DNS suffixes of
 // home/office networks are rejected at descriptor validation.
 const CREDENTIAL_FORBIDDEN_HOST_SUFFIXES = ['.localhost', '.local', '.internal', '.lan', '.home.arpa'];
+
+// Public-DNS host judgment, shared by credential origins (C3) and MCP
+// server urls (C3 phase-2 §3.2) — ONE judgment, two callers, so the two
+// surfaces can never drift apart. Loopback names, IP literals and the
+// private DNS suffixes of home/office networks are never public.
+function hostIsPublicDnsName(host) {
+  const isIPv4 = /^[0-9.]+$/.test(host) && host.indexOf('.') !== -1;
+  const isIPv6 = host.charAt(0) === '[' || host.indexOf(':') !== -1;
+  const forbiddenSuffix = CREDENTIAL_FORBIDDEN_HOST_SUFFIXES.some((s) => host.endsWith(s));
+  return !(isIPv4 || isIPv6 || host === 'localhost' || host.endsWith('.') || forbiddenSuffix
+    || host.indexOf('.') === -1);
+}
 // Credential connection state vocabulary (C3 §3.2). Default is
 // needs-connection: a registered credential binding is not a connection.
 const CREDENTIAL_STATES = Object.freeze(['connected', 'needs-connection', 'needs-reconfirm']);
@@ -382,14 +524,11 @@ function validateCredentialBinding(raw, capabilityId, index) {
       + JSON.stringify(raw.origin === undefined ? null : raw.origin));
   }
   const host = url.hostname;
-  const isIPv4 = /^[0-9.]+$/.test(host) && host.indexOf('.') !== -1;
-  const isIPv6 = host.charAt(0) === '[' || host.indexOf(':') !== -1;
-  const forbiddenSuffix = CREDENTIAL_FORBIDDEN_HOST_SUFFIXES.some((s) => host.endsWith(s));
   // A trailing dot round-trips through url.origin verbatim (WHATWG keeps
   // the DNS root hint), but bindings compare origins EXACTLY — accepting
   // "https://api.example.com." would fork a second binding beside the
   // dot-less one. Rejected even for otherwise-public names.
-  if (isIPv4 || isIPv6 || host === 'localhost' || host.endsWith('.') || forbiddenSuffix || host.indexOf('.') === -1) {
+  if (!hostIsPublicDnsName(host)) {
     throw extensionDescriptorError(at + ': "origin" host ' + JSON.stringify(host)
       + ' is not a public DNS name (credentials are sent only to public hosts)');
   }
@@ -512,6 +651,14 @@ function validateCatalogSet(catalogs) {
         throw extensionDescriptorError('credential name "' + credential.name + '" is declared by both capability ' + owner + ' and capability ' + cap.id);
       }
       credentialOwners.set(credential.name, cap.id);
+    }
+    // C3 phase-2 §3.3: a capability that references a LOCAL connectable
+    // mcp descriptor must satisfy the binding rules against its own
+    // credentials. References to non-local ids stay free-form (external
+    // authorities are nameable without existing locally).
+    for (const ref of cap.mcps) {
+      const m = mcps.get(ref);
+      if (m) validateMcpBinding(m, cap);
     }
     capabilities.set(cap.id, cap);
   }
@@ -826,6 +973,13 @@ class CapabilityManager {
       if (this._mcps.has(id) && !same(this._mcps.get(id), d)) {
         throw extensionDescriptorError('package ' + cap.id + ': mcp ' + id + ' conflicts with an already registered mcp of the same id');
       }
+    }
+    // C3 phase-2 §3.3: every connectable server the package ships must
+    // satisfy the binding rules against the package's own credentials
+    // (declared by this capability, bearer form, binding covers the url).
+    // Legacy entries pass through untouched.
+    for (const [id, d] of mcps) {
+      validateMcpBinding(d, cap);
     }
     // C3: credential names are unique ACROSS capabilities — a package may
     // not register a credential name another capability already owns.
@@ -1311,7 +1465,18 @@ class CapabilityManager {
     }
     const mcpList = [];
     for (const [mcpId, state] of mcps) {
-      mcpList.push(this._freeze({ id: mcpId, displayName: this._mcpDisplayName(mcpId), state: state }));
+      // C3 phase-2 §10.2: the snapshot entries carry the endpoint fields
+      // when the descriptor declares them (routing metadata only — never
+      // values); legacy entries keep the exact baseline shape.
+      const m = this._mcps.get(mcpId);
+      const entry = { id: mcpId, displayName: this._mcpDisplayName(mcpId) };
+      if (m && m.url !== undefined) {
+        entry.url = m.url;
+        entry.auth = m.auth;
+        entry.credential = m.credential;
+      }
+      entry.state = state;
+      mcpList.push(this._freeze(entry));
     }
     const pythonPlugins = pluginList.filter((p) => p.runtime === 'python');
     return this._freeze({
@@ -1420,6 +1585,7 @@ export {
 };
 export {
   validatePluginDescriptor, validateSkillDescriptor, validateMcpDescriptor,
+  validateMcpBinding,
   validateCapabilityDescriptor, validateCatalogSet,
   CAPABILITY_STATES, MCP_STATES, SKILL_INSTANCE_ROOT, skillInstancePath,
   SKILL_INSTANCE_MARKER, SKILL_INSTANCE_MAX_BYTES, PLUGIN_RUNTIMES, sha256Hex,
