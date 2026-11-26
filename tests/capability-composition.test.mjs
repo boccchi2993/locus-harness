@@ -680,6 +680,13 @@ async function run() {
     && mcpEnv.mcps[0].auth === 'bearer' && mcpEnv.mcps[0].credential === 'ACME_API_TOKEN'
     && mcpEnv.mcps[0].state === 'connected');
   check('MC33 snapshot mcp entry stays deeply frozen', Object.isFrozen(mcpEnv.mcps[0]));
+  const catalogView = mcpPkgMgr.listCapabilities().find((c) => c.id === 'mcp-cap');
+  check('MC32b the catalog view mcps[] carries the endpoint fields too (§10.3 capture)',
+    catalogView && catalogView.mcps.length === 1
+    && catalogView.mcps[0].url === 'https://mcp.acme.example/mcp'
+    && catalogView.mcps[0].auth === 'bearer'
+    && catalogView.mcps[0].credential === 'ACME_API_TOKEN'
+    && catalogView.mcps[0].state === 'connected');
   const mcpPkgMgr2 = await newManager({}, { noPackages: true });
   await mcpPkgMgr2.registerPackage({
     capability: {

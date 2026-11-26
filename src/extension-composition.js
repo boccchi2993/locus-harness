@@ -822,11 +822,23 @@ class CapabilityManager {
         },
         plugins: cap.plugins.map((id) => this._pluginSummary(id)),
         skills: cap.skills.map((id) => this._skillSummary(id)),
-        mcps: cap.mcps.map((id) => ({
-          id: id,
-          displayName: this._mcpDisplayName(id),
-          state: this._mcpState(id),
-        })),
+        // C3 phase-2 §10.3: the catalog view carries the endpoint fields
+        // when the descriptor declares them (the Product captures a
+        // version's OLD declarations from here at replacement time).
+        mcps: cap.mcps.map((id) => {
+          const m = this._mcps.get(id);
+          const entry = {
+            id: id,
+            displayName: this._mcpDisplayName(id),
+            state: this._mcpState(id),
+          };
+          if (m && m.url !== undefined) {
+            entry.url = m.url;
+            entry.auth = m.auth;
+            entry.credential = m.credential;
+          }
+          return entry;
+        }),
         // C3: credential BINDINGS are catalog facts visible in EVERY
         // state — the settings UI renders credentials + Connect on
         // disabled and failed capabilities too. Fresh objects each call
