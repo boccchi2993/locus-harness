@@ -30,6 +30,7 @@ import {
   CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
   validatePluginDescriptor, validateSkillDescriptor,
   validateCapabilityDescriptor, validateCatalogSet,
+  validateMcpDescriptor, validateMcpBinding,
   CAPABILITY_STATES, MCP_STATES, SKILL_INSTANCE_ROOT, skillInstancePath,
 } from '../src/extension-composition.js';
 import { buildSystemPrompt, AgentSession } from '../src/agent.js';
@@ -516,6 +517,218 @@ async function run() {
   await umgr.enable('synthetic-mcp-capability');
   umgr.setMcpState('synthetic-service', 'unavailable');
   check('M32 unavailable authority also keeps needs-connection', umgr.capabilityState('synthetic-mcp-capability') === 'needs-connection');
+
+  // ---- C3 phase-2 §10.2: mcp endpoint fields + validateMcpBinding ----
+  // Appendix A descriptor/binding samples (M1, M2, M4–M13, harness side).
+  const mcpBase = {
+    id: 'acme-docs', displayName: 'Acme Documents', description: 'Search and read documents stored in Acme.',
+  };
+  const endpointFields = {
+    url: 'https://mcp.acme.example/mcp', auth: 'bearer', credential: 'ACME_API_TOKEN',
+  };
+  const credOk = {
+    name: 'ACME_API_TOKEN', label: 'Acme API token', origin: 'https://mcp.acme.example',
+    pathPrefix: '/', header: 'Authorization', scheme: 'Bearer',
+  };
+  const legacyDescriptor = validateMcpDescriptor(mcpBase); // M2
+  check('MC1 legacy descriptor normalizes to exactly the four baseline keys (M2)',
+    JSON.stringify(legacyDescriptor) === JSON.stringify({
+      kind: 'mcp', id: 'acme-docs', displayName: 'Acme Documents',
+      description: 'Search and read documents stored in Acme.',
+    }));
+  const fullDescriptor = validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields)); // M1
+  check('MC2 endpoint descriptor keys come in the fixed order (M1)',
+    JSON.stringify(Object.keys(fullDescriptor)) === JSON.stringify(
+      ['kind', 'id', 'displayName', 'description', 'url', 'auth', 'credential'])
+    && fullDescriptor.url === 'https://mcp.acme.example/mcp'
+    && fullDescriptor.auth === 'bearer' && fullDescriptor.credential === 'ACME_API_TOKEN');
+  await throwsWith('MC3 auth "oauth" is rejected and the message names bearer (M4)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { auth: 'oauth' })),
+    'ExtensionDescriptorError', 'bearer');
+  await throwsWith('MC4 url-only is rejected — the three fields are all-or-nothing (M6)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, { url: endpointFields.url })),
+    'ExtensionDescriptorError', 'declared together');
+  await throwsWith('MC5 auth+credential without url is rejected — all-or-nothing',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, { auth: 'bearer', credential: 'ACME_API_TOKEN' })),
+    'ExtensionDescriptorError', 'declared together');
+  await throwsWith('MC6 non-canonical url is rejected (M10)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example' })),
+    'ExtensionDescriptorError', 'canonical');
+  await throwsWith('MC7 url with a query string is rejected (M11)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example/mcp?api_key=abc' })),
+    'ExtensionDescriptorError', 'query');
+  await throwsWith('MC8 url with a fragment is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example/mcp#frag' })),
+    'ExtensionDescriptorError', 'fragment');
+  await throwsWith('MC9 url with userinfo is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://user:pw@mcp.acme.example/mcp' })),
+    'ExtensionDescriptorError', 'userinfo');
+  await throwsWith('MC10 http url is rejected (M12)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'http://mcp.acme.example/mcp' })),
+    'ExtensionDescriptorError', 'https URL');
+  await throwsWith('MC11 .internal host is rejected (M13)',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.internal/mcp' })),
+    'ExtensionDescriptorError', 'public DNS');
+  await throwsWith('MC12 IP-literal host is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://93.184.216.34/mcp' })),
+    'ExtensionDescriptorError', 'public DNS');
+  await throwsWith('MC13 localhost host is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://localhost/mcp' })),
+    'ExtensionDescriptorError', 'public DNS');
+  await throwsWith('MC14 trailing-dot host is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example./mcp' })),
+    'ExtensionDescriptorError', 'public DNS');
+  await throwsWith('MC15 non-canonical non-default-port spelling is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example:443/mcp' })),
+    'ExtensionDescriptorError', 'canonical');
+  await throwsWith('MC16 pathname with ".." is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example/a..b/mcp' })),
+    'ExtensionDescriptorError', 'pathname');
+  await throwsWith('MC17 pathname with "//" is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example//mcp' })),
+    'ExtensionDescriptorError', 'pathname');
+  await throwsWith('MC18 pathname with "%" is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { url: 'https://mcp.acme.example/mcp%2Fx' })),
+    'ExtensionDescriptorError', 'pathname');
+  await throwsWith('MC19 over-2048-character url is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields,
+      { url: 'https://mcp.acme.example/' + 'a'.repeat(2048) })),
+    'ExtensionDescriptorError', '2048');
+  await throwsWith('MC20 credential name outside the pattern is rejected',
+    () => validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields, { credential: 'acme_token' })),
+    'ExtensionDescriptorError', 'credential');
+
+  const capWithCred = validateCapabilityDescriptor({
+    id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+    credentials: [Object.assign({}, credOk)],
+  });
+  const capWithoutCred = validateCapabilityDescriptor({
+    id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+  });
+  check('MC21 binding passes for a covered bearer credential', validateMcpBinding(fullDescriptor, capWithCred) === null);
+  check('MC22 a legacy descriptor needs no binding check', validateMcpBinding(legacyDescriptor, capWithCred) === null);
+  const bindingThrows = async (name, mcp, cap, rule, msgPart) => {
+    try {
+      validateMcpBinding(mcp, cap);
+      check(name, false, 'expected throw');
+    } catch (e) {
+      check(name, e.name === 'ExtensionDescriptorError' && e.mcpBindingRule === rule
+        && String(e.message).includes(msgPart), e.name + ' (' + e.mcpBindingRule + '): ' + e.message);
+    }
+  };
+  await bindingThrows('MC23 undeclared credential is refused (M7)',
+    fullDescriptor, capWithoutCred, 'credential-reference', 'not declared by capability');
+  await bindingThrows('MC24 x-api-key credential cannot secure a server (M8)',
+    fullDescriptor, validateCapabilityDescriptor({
+      id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+      credentials: [Object.assign({}, credOk, { header: 'X-Api-Key' })],
+    }), 'bearer-scheme', 'bearer binding');
+  await bindingThrows('MC25 credential without a scheme cannot secure a server',
+    fullDescriptor, validateCapabilityDescriptor({
+      id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+      credentials: [Object.assign({}, credOk, { scheme: undefined })],
+    }), 'bearer-scheme', 'scheme null');
+  await bindingThrows('MC26 a different host is not covered',
+    fullDescriptor, validateCapabilityDescriptor({
+      id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+      credentials: [Object.assign({}, credOk, { origin: 'https://api.acme.example' })],
+    }), 'endpoint-coverage', 'does not cover');
+  const capV1 = validateCapabilityDescriptor({
+    id: 'acme-docs', version: '1.0.0', displayName: 'Acme Documents', description: 'd',
+    credentials: [Object.assign({}, credOk, { pathPrefix: '/v1/' })],
+  });
+  await bindingThrows('MC27 /v1/ prefix does not cover /mcp (M9)',
+    fullDescriptor, capV1, 'endpoint-coverage', 'does not cover');
+  const v1Descriptor = validateMcpDescriptor(Object.assign({}, mcpBase, endpointFields,
+    { url: 'https://mcp.acme.example/v1/mcp' }));
+  check('MC28 /v1/ prefix covers /v1/mcp', validateMcpBinding(v1Descriptor, capV1) === null);
+
+  await throwsWith('MC29 a catalog set with a violated binding fails loudly',
+    () => validateCatalogSet({
+      mcps: [Object.assign({}, mcpBase, endpointFields)],
+      capabilities: [{
+        id: 'acme-docs', version: '1', displayName: 'Acme Documents', description: 'd',
+        plugins: [], skills: [], mcps: ['acme-docs'],
+      }],
+    }), 'ExtensionDescriptorError', 'not declared by capability');
+  const goodSet = validateCatalogSet({
+    mcps: [Object.assign({}, mcpBase, endpointFields)],
+    capabilities: [{
+      id: 'acme-docs', version: '1', displayName: 'Acme Documents', description: 'd',
+      plugins: [], skills: [], mcps: ['acme-docs'], credentials: [Object.assign({}, credOk)],
+    }],
+  });
+  check('MC30 a catalog set with a satisfied binding loads', goodSet.mcps.has('acme-docs') && goodSet.capabilities.has('acme-docs'));
+  check('MC31 legacy snapshot entries keep the exact baseline shape',
+    !('url' in umgr.buildTaskEnvironment().mcps[0]) && !('auth' in umgr.buildTaskEnvironment().mcps[0])
+    && !('credential' in umgr.buildTaskEnvironment().mcps[0]));
+  const mcpPkgMgr = await newManager({}, { noPackages: true });
+  await mcpPkgMgr.registerPackage({
+    capability: {
+      id: 'mcp-cap', version: '1', displayName: 'MCP Cap', description: 'TEST ONLY binding proof.',
+      plugins: [], skills: [], mcps: ['acme-docs'], credentials: [Object.assign({}, credOk)],
+    },
+    plugins: [], skills: [],
+    mcps: [Object.assign({}, mcpBase, endpointFields)],
+    sources: {}, artifacts: {},
+  });
+  await mcpPkgMgr.enable('mcp-cap');
+  mcpPkgMgr.setMcpState('acme-docs', 'connected');
+  const mcpEnv = mcpPkgMgr.buildTaskEnvironment();
+  check('MC32 snapshot mcps[] carries the three endpoint fields',
+    mcpEnv.mcps.length === 1 && mcpEnv.mcps[0].url === 'https://mcp.acme.example/mcp'
+    && mcpEnv.mcps[0].auth === 'bearer' && mcpEnv.mcps[0].credential === 'ACME_API_TOKEN'
+    && mcpEnv.mcps[0].state === 'connected');
+  check('MC33 snapshot mcp entry stays deeply frozen', Object.isFrozen(mcpEnv.mcps[0]));
+  const catalogView = mcpPkgMgr.listCapabilities().find((c) => c.id === 'mcp-cap');
+  check('MC32b the catalog view mcps[] carries the endpoint fields too (§10.3 capture)',
+    catalogView && catalogView.mcps.length === 1
+    && catalogView.mcps[0].url === 'https://mcp.acme.example/mcp'
+    && catalogView.mcps[0].auth === 'bearer'
+    && catalogView.mcps[0].credential === 'ACME_API_TOKEN'
+    && catalogView.mcps[0].state === 'connected');
+  const mcpPkgMgr2 = await newManager({}, { noPackages: true });
+  await mcpPkgMgr2.registerPackage({
+    capability: {
+      id: 'mcp-cap', version: '1', displayName: 'MCP Cap', description: 'TEST ONLY binding proof.',
+      plugins: [], skills: [], mcps: ['acme-docs'], credentials: [Object.assign({}, credOk)],
+    },
+    plugins: [], skills: [],
+    mcps: [Object.assign({}, mcpBase, endpointFields)],
+    sources: {}, artifacts: {},
+  });
+  await throwsWith('MC34 same-id different-credential package is refused',
+    () => mcpPkgMgr2.registerPackage({
+      capability: {
+        id: 'mcp-cap-2', version: '1', displayName: 'MCP Cap 2', description: 'TEST ONLY conflict proof.',
+        plugins: [], skills: [], mcps: ['acme-docs'],
+        credentials: [Object.assign({}, credOk, { name: 'OTHER_TOKEN', label: 'Other token' })],
+      },
+      plugins: [], skills: [],
+      mcps: [Object.assign({}, mcpBase, endpointFields, { credential: 'OTHER_TOKEN' })],
+      sources: {}, artifacts: {},
+    }), 'ExtensionDescriptorError', 'conflicts with an already registered mcp');
+  await throwsWith('MC35 a package binding outside its own credentials is refused',
+    () => mcpPkgMgr2.registerPackage({
+      capability: {
+        id: 'mcp-cap-3', version: '1', displayName: 'MCP Cap 3', description: 'TEST ONLY binding proof.',
+        plugins: [], skills: [], mcps: ['acme-2'],
+      },
+      plugins: [], skills: [],
+      mcps: [Object.assign({}, mcpBase, { id: 'acme-2' }, endpointFields)],
+      sources: {}, artifacts: {},
+    }), 'ExtensionDescriptorError', 'not declared by capability');
+  await mcpPkgMgr2.registerPackage({
+    capability: {
+      id: 'legacy-mcp-cap', version: '1', displayName: 'Legacy MCP Cap', description: 'TEST ONLY legacy proof.',
+      plugins: [], skills: [], mcps: ['legacy-service'],
+    },
+    plugins: [], skills: [],
+    mcps: [Object.assign({}, mcpBase, { id: 'legacy-service' })],
+    sources: {}, artifacts: {},
+  });
+  check('MC36 a legacy (no-endpoint) package registers without credentials',
+    mcpPkgMgr2.isPackage('legacy-mcp-cap'));
 
   // ---- catalog replacement (test/e2e injection path) ----
   const rmgr = await newManager();

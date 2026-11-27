@@ -85,11 +85,22 @@ function ApprovalBusyError(message) {
 // reserved schemas so the controller is not hardwired to allow/deny.
 // C3: persistentScope marks the kinds whose allow decisions may carry
 // scope 'persistent' (a durable grant), mirroring sessionScope.
+// C3 phase-2 §8.4: 'elicitation' suspends on an MCP server's form
+// request. Outcomes are accept / decline / cancel; an 'accept' decision
+// may carry `content` (the plain object of form answers — carried into
+// the decision, never persisted, never a grant). Escape-style dismissal
+// maps to 'cancel' (like capability/confirmation), not a deny.
 const APPROVAL_KINDS = {
   permission: { outcomes: ['allow', 'deny'], sessionScope: true, persistentScope: true },
   capability: { outcomes: ['confirm', 'decline', 'unsure'], sessionScope: false, persistentScope: false },
   confirmation: { outcomes: ['confirm', 'cancel'], sessionScope: false, persistentScope: false },
+  elicitation: { outcomes: ['accept', 'decline', 'cancel'], sessionScope: false, persistentScope: false },
 };
+
+// Plain-object shape test for elicitation payloads and contents.
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
 // Grants match the EXACT normalized policy key: trim, require non-empty.
 // Model-supplied strings ("*", "allow everything") are just keys that were
@@ -307,17 +318,46 @@ class ApprovalController {
 
     // C3 decision order: persistent grant → session grant → interactive
     // ask. A durable grant covers this exact policy key: resolve
-    // immediately — no pending state, no UI, no busy interaction.
-    if (policyKey && this._persistent.has(policyKey)) {
+    // immediately — no pending state, no UI, no busy interaction. Grants
+    // exist only for kinds whose scope flags allow them, so a kind that
+    // cannot create grants (e.g. 'elicitation') can never be auto-settled
+    // by a grant minted under a colliding key from another kind.
+    if (policyKey && kindSpec.persistentScope && this._persistent.has(policyKey)) {
       safeNotify('onEvent', () => this._onEvent('approval_grant_hit', { policyKey: policyKey, scope: 'persistent' }));
       return Promise.resolve({ outcome: 'allow', scope: 'persistent', requestId: null, viaGrant: true });
     }
 
     // A session grant covers this exact policy key: resolve immediately —
     // no pending state, no UI, no busy interaction.
-    if (policyKey && this._grants.has(policyKey)) {
+    if (policyKey && kindSpec.sessionScope && this._grants.has(policyKey)) {
       safeNotify('onEvent', () => this._onEvent('approval_grant_hit', { policyKey: policyKey }));
       return Promise.resolve({ outcome: 'allow', scope: 'session', requestId: null, viaGrant: true });
+    }
+
+    // C3 phase-2 §8.4: only elicitation requests may carry the
+    // `elicitation` payload ({ message, requestedSchema }) — the form the
+    // UI renders while the request is pending. It is Harness-constructed
+    // plain data, validated like every other request field.
+    if (s.elicitation !== undefined && s.kind !== 'elicitation') {
+      throw ApprovalError('approval kind "' + String(s.kind) + '" cannot carry an "elicitation" field'
+        + ' (only elicitation requests may)', 'invalid_elicitation');
+    }
+    let elicitation = null;
+    if (s.kind === 'elicitation' && s.elicitation !== undefined) {
+      if (!isPlainObject(s.elicitation)) {
+        throw ApprovalError('elicitation request field "elicitation" must be an object', 'invalid_elicitation');
+      }
+      if (s.elicitation.message !== undefined && typeof s.elicitation.message !== 'string') {
+        throw ApprovalError('elicitation field "message" must be a string, got '
+          + typeof s.elicitation.message, 'invalid_elicitation');
+      }
+      if (s.elicitation.requestedSchema !== undefined && !isPlainObject(s.elicitation.requestedSchema)) {
+        throw ApprovalError('elicitation field "requestedSchema" must be an object', 'invalid_elicitation');
+      }
+      elicitation = {
+        message: typeof s.elicitation.message === 'string' ? s.elicitation.message : null,
+        requestedSchema: isPlainObject(s.elicitation.requestedSchema) ? s.elicitation.requestedSchema : null,
+      };
     }
 
     const id = 'apr-' + (++this._seq).toString(36) + '-' + approvalMakeId();
@@ -336,6 +376,7 @@ class ApprovalController {
       taskGeneration: Number.isFinite(s.taskGeneration) ? s.taskGeneration : null,
       createdAt: new Date().toISOString(),
     };
+    if (elicitation) request.elicitation = elicitation;
     if (!request.action.summary) {
       throw ApprovalError('approval request requires a non-empty action.summary', 'missing_summary');
     }
@@ -399,7 +440,22 @@ class ApprovalController {
         throw ApprovalError('decision outcome "' + String(d.outcome) + '" cannot carry persistent scope', 'invalid_scope');
       }
     }
-    this._finish(pending.id, { outcome: d.outcome, scope: scope, requestId: pending.id }, 'approval_resolved');
+    // C3 phase-2 §8.4: an elicitation 'accept' may carry `content` — the
+    // plain object of form answers, forwarded verbatim in the decision.
+    // Content on any other outcome (decline/cancel) or any other kind is
+    // a caller bug, not a user choice.
+    let content;
+    if (d.content !== undefined) {
+      if (pending.kind !== 'elicitation' || d.outcome !== 'accept' || !isPlainObject(d.content)) {
+        throw ApprovalError('decision outcome "' + String(d.outcome) + '" of approval kind "'
+          + pending.kind + '" cannot carry content (only an elicitation "accept" may, as a plain object)',
+          'invalid_decision');
+      }
+      content = d.content;
+    }
+    const settled = { outcome: d.outcome, scope: scope, requestId: pending.id };
+    if (content !== undefined) settled.content = content;
+    this._finish(pending.id, settled, 'approval_resolved');
     if (scope === 'session' && pending.policyKey) {
       this._grants.set(pending.policyKey, { requestId: pending.id, createdAt: new Date().toISOString() });
       safeNotify('onEvent', () => this._onEvent('approval_grant_added', { policyKey: pending.policyKey }));

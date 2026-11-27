@@ -44,11 +44,11 @@ const entry = await import('../src/index.js');
 {
   const fns = [
     'validateCapabilityDescriptor', 'validatePluginDescriptor',
-    'validateSkillDescriptor', 'validateMcpDescriptor',
+    'validateSkillDescriptor', 'validateMcpDescriptor', 'validateMcpBinding',
     'skillInstancePath', 'sha256Hex',
   ];
   const missingFns = fns.filter((n) => typeof entry[n] !== 'function');
-  check('C1 the four descriptor validators + skill path + sha256Hex are entry functions',
+  check('C1 the five descriptor/binding validators + skill path + sha256Hex are entry functions',
     missingFns.length === 0, JSON.stringify(missingFns));
   check('C1 SKILL_INSTANCE_MAX_BYTES is an entry constant (the 256 KiB skill contract)',
     typeof entry.SKILL_INSTANCE_MAX_BYTES === 'number' && entry.SKILL_INSTANCE_MAX_BYTES > 0,
@@ -118,6 +118,30 @@ const descriptorError = (e) =>
   catch (e) { mcpBad = e; }
   check('C3 an MCP descriptor with a non-path-safe id fails loudly',
     descriptorError(mcpBad), mcpBad && (mcpBad.name + ': ' + mcpBad.message));
+
+  // C3 phase-2 §10.2: the binding validator is an entry function and the
+  // capabilityMcp declaration is live.
+  const boundMcp = entry.validateMcpDescriptor({
+    id: 'entry-mcp', url: 'https://mcp.entry.example/mcp', auth: 'bearer', credential: 'ENTRY_TOKEN',
+  });
+  const boundCap = entry.validateCapabilityDescriptor({
+    id: 'entry-cap', version: '1', displayName: 'Entry Cap', description: 'd',
+    credentials: [{ name: 'ENTRY_TOKEN', label: 'Entry token', origin: 'https://mcp.entry.example', pathPrefix: '/', header: 'Authorization', scheme: 'Bearer' }],
+  });
+  check('C3 a satisfied MCP binding passes through the entry validator',
+    entry.validateMcpBinding(boundMcp, boundCap) === null);
+  let bindingBad = null;
+  try { entry.validateMcpBinding(boundMcp, entry.validateCapabilityDescriptor({ id: 'entry-cap', version: '1', displayName: 'Entry Cap', description: 'd' })); }
+  catch (e) { bindingBad = e; }
+  check('C3 an unsatisfied MCP binding fails loudly and names its rule',
+    descriptorError(bindingBad) && bindingBad.mcpBindingRule === 'credential-reference',
+    bindingBad && (bindingBad.name + ': ' + bindingBad.message));
+
+  const declaration = entry.harnessCapabilities();
+  check('C3 harnessCapabilities declares capabilityMcp (C3 phase-2)',
+    declaration.capabilities.capabilityMcp === true);
+  check('C3 the approval port keeps the M2c shape (kinds stay omitted)',
+    declaration.ports.approval.version === 1 && !('kinds' in declaration.ports.approval));
 }
 
 // ---------- C4. the public skill contract agrees with the REAL manager ----------
